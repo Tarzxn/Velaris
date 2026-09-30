@@ -1,4 +1,4 @@
-"""Forge (Gen 2) — an Ollama Cloud-powered, downloadable file workspace."""
+"""Velaris (Gen 2) — an Ollama Cloud-powered, downloadable file workspace."""
 import base64
 import io
 import json
@@ -6,20 +6,16 @@ import math
 import mimetypes
 import os
 import re
-import secrets
 import textwrap
-import threading
 import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
-from functools import wraps
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 import requests
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file, stream_with_context
-from werkzeug.security import check_password_hash, generate_password_hash
 from docx import Document
 from docx.shared import Pt
 from openpyxl import Workbook
@@ -37,180 +33,6 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 WORKSPACES = Path(os.environ.get("WORKSPACE_DIR", "data/workspaces"))
 WORKSPACES.mkdir(parents=True, exist_ok=True)
 WORKSPACE_MAX_AGE_SECONDS = 2 * 60 * 60  # ephemeral disk: prune old workspaces so it never fills up
-
-# ---- Authentication --------------------------------------------------------
-# Two different lifetimes, on purpose:
-#  - ACCOUNTS (who is allowed to log in) are persisted to disk, hashed, so
-#    people don't have to re-register every time the server restarts — that
-#    would make a login system pointless.
-#  - SESSIONS (being currently logged in) and conversation history are NOT
-#    persisted anywhere durable: session tokens live only in this in-memory
-#    dict (wiped on restart) and are never set as a cookie — the browser
-#    holds its token in sessionStorage, cleared the moment the tab closes, and
-#    sends it explicitly on every request. There is no mechanism for a
-#    returning visitor to be silently auto-logged-in.
-USERS_FILE = Path(os.environ.get("USERS_FILE", "data/users.json"))
-FORGE_USERNAME = os.environ.get("FORGE_USERNAME", "").strip()  # optional seed account, see seed_admin_account()
-FORGE_PASSWORD = os.environ.get("FORGE_PASSWORD", "").strip()
-SESSION_TOKENS = {}  # token -> expiry unix timestamp
-_session_lock = threading.Lock()  # gthread workers mean real concurrent threads touch this dict now
-SESSION_TTL_SECONDS = int(os.environ.get("FORGE_SESSION_HOURS", "12")) * 3600
-USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
-_users_lock = threading.Lock()  # gunicorn now runs with gthread workers, so concurrent requests within one process are real
-
-# Optional free persistence for accounts across redeploys on hosts (like
-# Render's free tier) that don't offer a persistent disk at all: sync
-# users.json to a private GitHub Gist instead, using a personal access token
-# you already have from having a GitHub account — no new paid service, no new
-# signup. This is layered on top of the local file, never replaces it: every
-# read/write still touches the local file too, and any GitHub failure is
-# swallowed and falls back to whatever's local, so a network hiccup or an
-# unset token never breaks login.
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-GITHUB_GIST_ID = os.environ.get("GITHUB_GIST_ID", "").strip()
-GITHUB_GIST_FILENAME = "forge_users.json"
-GITHUB_API_VERSION = "2022-11-28"
-
-
-def _github_headers():
-    return {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": GITHUB_API_VERSION}
-
-
-def _gist_load():
-    """Best-effort read from the configured gist. Returns None (never raises)
-    if sync isn't configured or the call fails, so callers fall back to the
-    local file instead."""
-    if not (GITHUB_TOKEN and GITHUB_GIST_ID): return None
-    try:
-        response = requests.get(f"https://api.github.com/gists/{GITHUB_GIST_ID}", headers=_github_headers(), timeout=10)
-        response.raise_for_status()
-        file_data = response.json().get("files", {}).get(GITHUB_GIST_FILENAME)
-        if not file_data or file_data.get("truncated"): return None
-        return json.loads(file_data["content"])
-    except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError):
-        return None
-
-
-def _gist_save(users):
-    """Best-effort push to the configured gist. Never raises — a failed sync
-    just means the local file (and, until the next successful sync, whatever
-    was already in the gist) stays the source of truth instead."""
-    if not (GITHUB_TOKEN and GITHUB_GIST_ID): return
-    try:
-        requests.patch(
-            f"https://api.github.com/gists/{GITHUB_GIST_ID}",
-            headers=_github_headers(),
-            json={"files": {GITHUB_GIST_FILENAME: {"content": json.dumps(users, indent=2)}}},
-            timeout=10,
-        )
-    except requests.RequestException as error:
-        print(f"[Forge] Warning: could not sync accounts to GitHub Gist: {error}")
-
-
-def _gist_create_if_needed():
-    """If a token is set but no gist ID, create a new private gist once and
-    print its ID. The operator needs to copy that into a GITHUB_GIST_ID env
-    var — without it, every restart would create a brand new empty gist
-    instead of reusing the same one, which defeats the point."""
-    global GITHUB_GIST_ID
-    if not GITHUB_TOKEN or GITHUB_GIST_ID: return
-    try:
-        response = requests.post(
-            "https://api.github.com/gists",
-            headers=_github_headers(),
-            json={"description": "Forge account store — do not edit by hand", "public": False,
-                  "files": {GITHUB_GIST_FILENAME: {"content": "{}"}}},
-            timeout=10,
-        )
-        response.raise_for_status()
-        GITHUB_GIST_ID = response.json()["id"]
-        print(f"[Forge] Created a private gist for account storage: {GITHUB_GIST_ID}")
-        print(f"[Forge] IMPORTANT: set GITHUB_GIST_ID={GITHUB_GIST_ID} as an env var now — "
-              f"without it, the next restart creates a new, empty gist instead of reusing this one.")
-    except (requests.RequestException, KeyError, ValueError) as error:
-        print(f"[Forge] Warning: could not create a gist for account storage: {error}. Falling back to local-file-only persistence.")
-
-
-def load_users():
-    remote = _gist_load()
-    if remote is not None: return remote
-    if not USERS_FILE.exists(): return {}
-    try:
-        return json.loads(USERS_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_users(users):
-    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    USERS_FILE.write_text(json.dumps(users, indent=2))
-    _gist_save(users)
-
-
-def create_user(username, password):
-    """Caller must hold _users_lock. Returns False if the username is taken."""
-    users = load_users()
-    key = username.lower()
-    if key in users: return False
-    users[key] = {"username": username, "password_hash": generate_password_hash(password), "created_at": time.time()}
-    save_users(users)
-    return True
-
-
-def seed_admin_account():
-    """Optional convenience: FORGE_USERNAME/FORGE_PASSWORD, if both set, are
-    created as a standing account on startup — same as it worked before
-    self-signup existed — so existing deployments keep working unchanged."""
-    if not FORGE_USERNAME or not FORGE_PASSWORD: return
-    with _users_lock:
-        create_user(FORGE_USERNAME, FORGE_PASSWORD)
-
-
-_gist_create_if_needed()
-seed_admin_account()
-# A startup diagnostic, not an error: if this reads 0 accounts on every
-# restart even though people have signed up, accounts aren't actually
-# persisting (no GitHub sync configured and USERS_FILE isn't on persistent
-# storage — e.g. a Render free-tier service with no disk attached).
-print(f"[Forge] {len(load_users())} account(s) loaded"
-      f"{' (synced via GitHub Gist ' + GITHUB_GIST_ID + ')' if GITHUB_TOKEN and GITHUB_GIST_ID else f' from {USERS_FILE.resolve()}'}")
-
-
-def issue_token():
-    token = secrets.token_urlsafe(32)
-    with _session_lock:
-        SESSION_TOKENS[token] = time.time() + SESSION_TTL_SECONDS
-    return token
-
-
-def token_from_request():
-    header = request.headers.get("Authorization", "")
-    if header.lower().startswith("bearer "):
-        return header[7:].strip()
-    # Plain <a href> downloads/previews can't set custom headers, so those two
-    # routes also accept the token as a query string parameter.
-    return request.args.get("token", "").strip()
-
-
-def is_valid_token(token):
-    if not token: return False
-    with _session_lock:
-        expiry = SESSION_TOKENS.get(token)
-        if expiry is None: return False
-        if time.time() > expiry:
-            SESSION_TOKENS.pop(token, None)
-            return False
-        return True
-
-
-def require_auth(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if not is_valid_token(token_from_request()):
-            return jsonify(error="Not authenticated. Please log in."), 401
-        return view(*args, **kwargs)
-    return wrapped
-
 
 # Single server-side token for Ollama Cloud (https://ollama.com). Falls back
 # to the key provided at setup time so this runs out of the box; override by
@@ -246,7 +68,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
 # MODELS) supports: bool or "low"/"medium"/"high" (GPT-OSS specifically
 # always reasons at least a little regardless of the boolean value — "Low"
 # still gets the smallest token budget and skips the explicit higher levels).
-# There's no official "max" level at the Ollama API — Forge's "Max" instead
+# There's no official "max" level at the Ollama API — Velaris's "Max" instead
 # combines "high" thinking with the largest token budget and (for 3D
 # requests specifically) the largest model, which is the actual lever
 # available for going further than "High".
@@ -278,7 +100,7 @@ def looks_like_3d_request(prompt):
     output type here where model capability directly limits build quality."""
     return bool(_3D_REQUEST_PATTERN.search(prompt))
 
-SYSTEM = '''You are Forge, an expert software and artifact builder. Turn the request into a concise response plus files. Respond with ONLY valid JSON, no prose before or after it, no markdown code fences, using this schema:
+SYSTEM = '''You are Velaris, an expert software and artifact builder. Turn the request into a concise response plus files. Respond with ONLY valid JSON, no prose before or after it, no markdown code fences, using this schema:
 {"reply":"short helpful Markdown response","files":[{"path":"safe relative filename.ext","kind":"text|docx|xlsx|pptx|pdf|stl|image|chart|base64","content":"content for artifact"}]}
 Create useful, complete files. Use text for code, HTML, CSS, JSON, CSV, SVG (vector images), Markdown and arbitrary plain text.
 
@@ -288,17 +110,17 @@ For pptx, content is JSON slides like [{"title":"...","body":"one bullet per lin
 For a raster/photographic or artistic image, use kind "image" with a .png/.jpg path. content is either a plain English image-generation prompt, or JSON {"prompt":"...","aspect":"square|portrait|landscape"} for more control over framing — use vivid, specific, detailed prompts.
 For an actual DATA chart (bar/line/pie/scatter of real numbers) rather than an artistic picture, use kind "chart" with a .png path. content is JSON: {"type":"bar|line|pie|scatter","title":"...","x_label":"...","y_label":"...","labels":["A","B","C"],"series":[{"name":"Series 1","values":[1,2,3]}]}. Use "chart" whenever the user wants to see numbers plotted — it renders a real, accurate chart from the data instead of an AI-generated approximation of one.
 
-For a 3D model, use kind "stl" with a .stl path. Take real time to think this through — you are the CAD engineer: mentally model the object as an assembly of real, distinct parts and their spatial relationships before writing anything. content is JSON describing a BUILD PROGRAM that Forge parses and executes step by step:
+For a 3D model, use kind "stl" with a .stl path. Take real time to think this through — you are the CAD engineer: mentally model the object as an assembly of real, distinct parts and their spatial relationships before writing anything. content is JSON describing a BUILD PROGRAM that Velaris parses and executes step by step:
 {"plan":"a few sentences: what real-world parts does this object have, roughly what size is each, and how do they connect/align?","ops":[
   {"op":"add","shape":"box|sphere|cylinder|cone|torus|tube|capsule|wedge|pyramid","size":20,"radius":10,"height":20,"tube":4,"segments":16,"position":[x,y,z],"rotation":[rx,ry,rz],"scale":[sx,sy,sz]},
   {"op":"repeat","count":6,"rotate":[0,0,60],"around":[0,0,0]}
 ]}
-Shape params — "box": size [w,d,h] (or one number for a cube); optionally add "bore":{"axis":"x|y|z","radius":R,"segments":N} to punch a clean round hole straight through the box along that axis (e.g. a screw hole, a mounting hole, a cable pass-through, a pivot hole) — this is a real hole through solid material, not a decoration. "sphere"/"cylinder"/"cone": "radius" (+"height" for cylinder/cone). "torus": "radius" (ring) + "tube" (thickness). "tube": a hollow pipe/ring — "radius" (outer) + "inner_radius" + "height". "capsule": a pill shape — "radius" + "height" (straight section length; total length is height + 2*radius). "wedge": a ramp/doorstop/roof — size [w,d,h], sloped down along x. "pyramid": "size" (+optional "height"). "cylinder" with a low "segments" (e.g. 5, 6, 8) becomes a pentagonal/hexagonal/octagonal prism — use this for nuts, bolts, multi-sided posts, etc. instead of a separate prism shape. Leave "segments" unset to let Forge auto-pick a smooth value from the part's size; only set it explicitly for a deliberately low-poly/faceted look.
+Shape params — "box": size [w,d,h] (or one number for a cube); optionally add "bore":{"axis":"x|y|z","radius":R,"segments":N} to punch a clean round hole straight through the box along that axis (e.g. a screw hole, a mounting hole, a cable pass-through, a pivot hole) — this is a real hole through solid material, not a decoration. "sphere"/"cylinder"/"cone": "radius" (+"height" for cylinder/cone). "torus": "radius" (ring) + "tube" (thickness). "tube": a hollow pipe/ring — "radius" (outer) + "inner_radius" + "height". "capsule": a pill shape — "radius" + "height" (straight section length; total length is height + 2*radius). "wedge": a ramp/doorstop/roof — size [w,d,h], sloped down along x. "pyramid": "size" (+optional "height"). "cylinder" with a low "segments" (e.g. 5, 6, 8) becomes a pentagonal/hexagonal/octagonal prism — use this for nuts, bolts, multi-sided posts, etc. instead of a separate prism shape. Leave "segments" unset to let Velaris auto-pick a smooth value from the part's size; only set it explicitly for a deliberately low-poly/faceted look.
 Every shape is centered on its own local origin, then: scaled by "scale" [sx,sy,sz] (stretch into an ellipsoid, plank, etc.), rotated by "rotation" [rx,ry,rz] degrees (X then Y then Z, e.g. tilt a fin or lay a cylinder on its side), then moved to "position" [x,y,z]. All optional, default no scale/rotation, position [0,0,0].
 "repeat" duplicates the shape from the immediately preceding "add" "count"-1 more times: "rotate":[rx,ry,rz] rotates each successive copy further around the "around" pivot (default world origin) — radial patterns (gear teeth, wheel spokes, flower petals, fins around a body). "translate":[dx,dy,dz] offsets each successive copy further along that vector — linear patterns (fence posts, stair treads, table legs, shelf slats, a row of mounting holes). Combine both for a spiral/helix.
 "mirror" reflects the immediately preceding "add" across an axis-aligned plane through the origin (or through "offset" along that axis): {"op":"mirror","axis":"x|y|z","offset":0} — use for symmetric designs (matched wings, a hull's two sides, paired brackets) instead of specifying both halves by hand.
-There is deliberately no general subtract/union/intersect between arbitrary shapes — Forge tried a general boolean engine and it produced subtly broken (self-intersecting) geometry on realistic shapes during testing, so it was removed rather than shipped unreliable. Work within what's actually available: "bore" for holes through a box, "tube" for hollow cylinders/pipes/rings, overlapping "add"s for anything that reads fine as visually-merged solids (most non-precision parts don't need true CSG to look and print correctly).
-Design like an engineer, not an illustrator: before writing ops, work out in "plan" what the real object is made of (its distinct functional parts), roughly how big each one is relative to the others, and exactly how they align and connect (shared axis, shared face, a specific offset) — vague ops with parts floating unconnected or wildly mismatched in scale are the main way these builds go wrong. Build real objects from several parts (roughly 6-20 ops is normal for something detailed) — e.g. a mug = a "tube" body + a "torus" or bent-"capsule" handle positioned at the side; a table = one flat box top + 4 cylinder legs via one add + one repeat with translate; a gear = a short cylinder body + one tooth box at its edge + a repeat rotating around the center; a rocket = a cylinder body + a cone nose + a capsule or sphere tip + fin boxes via one add + a radial repeat; a bracket = a box with a "bore" for its mounting hole. Prefer the shape that is actually hollow/rounded/holed when the real object is (a cup or pipe should be a "tube" not a solid cylinder; a pill or rounded handle should be a "capsule" not a box; a mounting plate should use "bore" not a solid slab). Keep coordinates within roughly -200..200. If one of your ops is invalid Forge will skip just that piece and keep the rest, so don't let one uncertain part stop you from building the others.
+There is deliberately no general subtract/union/intersect between arbitrary shapes — Velaris tried a general boolean engine and it produced subtly broken (self-intersecting) geometry on realistic shapes during testing, so it was removed rather than shipped unreliable. Work within what's actually available: "bore" for holes through a box, "tube" for hollow cylinders/pipes/rings, overlapping "add"s for anything that reads fine as visually-merged solids (most non-precision parts don't need true CSG to look and print correctly).
+Design like an engineer, not an illustrator: before writing ops, work out in "plan" what the real object is made of (its distinct functional parts), roughly how big each one is relative to the others, and exactly how they align and connect (shared axis, shared face, a specific offset) — vague ops with parts floating unconnected or wildly mismatched in scale are the main way these builds go wrong. Build real objects from several parts (roughly 6-20 ops is normal for something detailed) — e.g. a mug = a "tube" body + a "torus" or bent-"capsule" handle positioned at the side; a table = one flat box top + 4 cylinder legs via one add + one repeat with translate; a gear = a short cylinder body + one tooth box at its edge + a repeat rotating around the center; a rocket = a cylinder body + a cone nose + a capsule or sphere tip + fin boxes via one add + a radial repeat; a bracket = a box with a "bore" for its mounting hole. Prefer the shape that is actually hollow/rounded/holed when the real object is (a cup or pipe should be a "tube" not a solid cylinder; a pill or rounded handle should be a "capsule" not a box; a mounting plate should use "bore" not a solid slab). Keep coordinates within roughly -200..200. If one of your ops is invalid Velaris will skip just that piece and keep the rest, so don't let one uncertain part stop you from building the others.
 
 Use base64 only for true binary payloads that don't fit the kinds above. If the request only needs a text answer, return an empty files list. When the user asks for a specific file format, use that exact extension and matching kind; NEVER use generation.md, generated.md, output.md, or document.md as a placeholder. Never use absolute paths, traversal, or more than 50 files.'''
 
@@ -485,9 +307,9 @@ def safe_path(value):
 
 # ---- Parametric solid-build engine for the "stl" kind ---------------------
 # Rather than trust free models to emit raw, hand-rolled vertex/face lists
-# (which are easy to get non-manifold or malformed), Forge exposes a small
+# (which are easy to get non-manifold or malformed), Velaris exposes a small
 # instruction set — add a primitive, repeat it with a rotation/translation —
-# and executes that program itself. The model writes the build steps; Forge
+# and executes that program itself. The model writes the build steps; Velaris
 # turns them into real, valid geometry.
 MAX_TRIANGLES = 260_000  # generous cap (user explicitly OK with slower/bigger builds) so a runaway program still can't hang the worker indefinitely
 MAX_OPS = 160
@@ -866,7 +688,7 @@ def run_stl_program(spec):
 
 
 def render_ascii_stl(triangles):
-    lines = ["solid forge"]
+    lines = ["solid velaris"]
     for a, b, c in triangles:
         ax, ay, az = a; bx, by, bz = b; cx, cy, cz = c
         ux, uy, uz = bx-ax, by-ay, bz-az
@@ -876,7 +698,7 @@ def render_ascii_stl(triangles):
         lines += [f" facet normal {nx/length:.6f} {ny/length:.6f} {nz/length:.6f}", "  outer loop"]
         lines += [f"   vertex {p[0]:.4f} {p[1]:.4f} {p[2]:.4f}" for p in (a, b, c)]
         lines += ["  endloop", " endfacet"]
-    lines.append("endsolid forge")
+    lines.append("endsolid velaris")
     return "\n".join(lines)
 
 
@@ -1283,69 +1105,20 @@ def tavily_search(query):
 def index(): return render_template("index.html")
 
 
-@app.post("/api/login")
-def login():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify(error="Malformed request body."), 400
-    username = str(data.get("username", "")).strip()
-    password = str(data.get("password", ""))
-    users = load_users()
-    if not users:
-        return jsonify(error='No accounts exist yet — use "Create account" below to set one up.'), 404
-    record = users.get(username.lower())
-    # check_password_hash is constant-time; run it even on a missing user
-    # (against a dummy hash) so a failed lookup and a wrong password take the
-    # same amount of time either way, and username existence can't be timed.
-    if not record:
-        check_password_hash(generate_password_hash("dummy"), password)
-        return jsonify(error="Incorrect username or password."), 401
-    if not check_password_hash(record["password_hash"], password):
-        return jsonify(error="Incorrect username or password."), 401
-    return jsonify(token=issue_token(), expiresIn=SESSION_TTL_SECONDS)
-
-
-@app.post("/api/signup")
-def signup():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify(error="Malformed request body."), 400
-    username = str(data.get("username", "")).strip()
-    password = str(data.get("password", ""))
-    if not USERNAME_RE.match(username):
-        return jsonify(error="Username must be 3-32 characters: letters, numbers, dots, hyphens, or underscores only."), 400
-    if len(password) < 8:
-        return jsonify(error="Password must be at least 8 characters."), 400
-    with _users_lock:
-        if not create_user(username, password):
-            return jsonify(error="That username is already taken."), 409
-    return jsonify(token=issue_token(), expiresIn=SESSION_TTL_SECONDS)
-
-
-@app.post("/api/logout")
-def logout():
-    with _session_lock:
-        SESSION_TOKENS.pop(token_from_request(), None)
-    return jsonify(ok=True)
-
-
 @app.get("/api/models")
-@require_auth
 def models():
     return jsonify(MODELS)
 
 
 @app.get("/api/config")
-@require_auth
 def config():
     return jsonify(webSearchEnabled=bool(TAVILY_API_KEY))
 
 
 @app.post("/api/chat")
-@require_auth
 def chat():
     if not OLLAMA_API_KEY:
-        return jsonify(error="Forge isn't configured yet: set the OLLAMA_API_KEY environment variable on the server to an Ollama Cloud API key (ollama.com/settings/keys), then restart."), 500
+        return jsonify(error="Velaris isn't configured yet: set the OLLAMA_API_KEY environment variable on the server to an Ollama Cloud API key (ollama.com/settings/keys), then restart."), 500
     # get_json(force=True) raises Flask's own HTML 400 page on a malformed
     # body, which broke the frontend's JSON parsing. silent=True + a manual
     # check keeps every response on this route JSON, even for bad input.
@@ -1358,9 +1131,9 @@ def chat():
 
     mode = str(data.get("mode", "assist")).lower()
     mode_instruction = (
-        "The user is in Forge mode. Prioritize complete deliverables, real files, multi-file projects, validation, and practical structure. "
+        "The user is in Velaris mode. Prioritize complete deliverables, real files, multi-file projects, validation, and practical structure. "
         "When a file is requested, create the actual requested format rather than explaining how to create it."
-        if mode == "forge" else
+        if mode == "velaris" else
         "The user is in Assist mode. Prefer a concise, useful conversational answer. Only create files when the user explicitly asks for one."
     )
     messages = [{"role": "system", "content": SYSTEM}, {"role": "system", "content": mode_instruction}] + data.get("history", [])[-10:]
@@ -1388,7 +1161,7 @@ def chat():
 
     # Ollama's native /api/chat shape differs from OpenAI-style APIs: no
     # response_format, generation options nest under "options". stream:true
-    # here (unlike earlier revisions) is what lets Forge show the reply as
+    # here (unlike earlier revisions) is what lets Velaris show the reply as
     # it's generated instead of one long wait. "think" triggers the model's
     # own extended reasoning before it answers — this is what "take its time
     # and think before building" actually maps to at the API level.
@@ -1516,7 +1289,6 @@ def chat():
 
 
 @app.get("/api/download/<workspace_id>")
-@require_auth
 def download(workspace_id):
     if not re.fullmatch(r"[a-f0-9]{32}", workspace_id): abort(404)
     root = WORKSPACES / workspace_id
@@ -1526,7 +1298,7 @@ def download(workspace_id):
         for file in root.rglob("*"):
             if file.is_file(): archive.write(file, file.relative_to(root))
     payload.seek(0)
-    return send_file(payload, as_attachment=True, download_name=f"forge-{workspace_id[:8]}.zip", mimetype="application/zip")
+    return send_file(payload, as_attachment=True, download_name=f"velaris-{workspace_id[:8]}.zip", mimetype="application/zip")
 
 
 def resolve_workspace_file(workspace_id, filename):
@@ -1542,14 +1314,12 @@ def resolve_workspace_file(workspace_id, filename):
 
 
 @app.get("/api/download/<workspace_id>/<path:filename>")
-@require_auth
 def download_single(workspace_id, filename):
     target = resolve_workspace_file(workspace_id, filename)
     return send_file(target, as_attachment=True, download_name=target.name)
 
 
 @app.get("/api/preview/<workspace_id>/<path:filename>")
-@require_auth
 def preview_single(workspace_id, filename):
     # Same safety checks as the download route, but served inline (not as an
     # attachment) with a guessed mimetype, so <img> tags can render it directly.
@@ -1560,9 +1330,8 @@ def preview_single(workspace_id, filename):
 
 if __name__ == "__main__":
     # debug=True enables Werkzeug's interactive in-browser debugger, which
-    # can execute arbitrary code from an error page — a real risk for an app
-    # that gates access behind login. Off by default; opt in explicitly for
-    # local development only, never in a real deployment (which uses
+    # can execute arbitrary code from an error page. Off by default; opt in
+    # explicitly for local development only, never in a real deployment (which uses
     # gunicorn via render.yaml/gunicorn.conf.py anyway, not this __main__ block).
     debug_mode = os.environ.get("FLASK_DEBUG", "").strip().lower() in ("1", "true", "yes")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=debug_mode)

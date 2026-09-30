@@ -4,13 +4,8 @@ const promptEl = $('#prompt');
 const sendBtn = $('#send');
 const HERO_HTML = $('#hero') ? $('#hero').outerHTML : '';
 
-// Conversations AND the auth token both live in sessionStorage, never
-// localStorage and never a cookie: sessionStorage is wiped the moment the
-// tab/browser closes, so nothing is "remembered" past that point, and
-// because it's not a cookie the browser never auto-attaches it anywhere —
-// every request explicitly carries the token itself.
-const CONV_KEY = 'forge.conversations';
-const TOKEN_KEY = 'forge.token';
+// Conversation history lives only in this browser tab. No account or login is required.
+const CONV_KEY = 'velaris.conversations';
 
 const state = {
   model: 'gpt-oss:20b',
@@ -22,7 +17,6 @@ const state = {
   activeId: null,
   sending: false,
   controller: null,
-  token: null,
   mode: 'assist',
 };
 
@@ -117,18 +111,16 @@ function fileIcon(path) {
 // Keeps each path segment correctly percent-encoded without turning the "/"
 // separators between folders into a literal "%2F" (which broke nested-file
 // downloads, since Flask's <path:filename> route never saw the real slash).
-// Plain <a href> links can't carry an Authorization header, so the auth
-// token rides along as a query parameter for these two routes specifically.
+// Downloads and previews are public within this open Velaris workspace.
 function workspaceUrl(base, workspace, path) {
   const segments = path.split('/').map(encodeURIComponent).join('/');
-  const sep = base.includes('?') ? '&' : '?';
-  return `${base}/${workspace}/${segments}${sep}token=${encodeURIComponent(state.token || '')}`;
+  return `${base}/${workspace}/${segments}`;
 }
 
 // Same idea but for the whole-workspace zip route, which has no per-file
 // path segment at all.
 function workspaceZipUrl(workspace) {
-  return `/api/download/${workspace}?token=${encodeURIComponent(state.token || '')}`;
+  return `/api/download/${workspace}`;
 }
 
 function buildArtifactHtml(data) {
@@ -303,19 +295,10 @@ function startNewConversation() {
   promptEl.focus();
 }
 
-// ---- Auth ------------------------------------------------------------
-// authFetch centralizes attaching the bearer token and reacting to a 401 by
-// dropping back to the login screen — every authenticated call in this file
-// goes through it instead of calling fetch() directly.
-async function authFetch(url, opts = {}) {
-  const headers = Object.assign({}, opts.headers, state.token ? { Authorization: `Bearer ${state.token}` } : {});
-  const response = await fetch(url, Object.assign({}, opts, { headers }));
-  if (response.status === 401) {
-    sessionStorage.removeItem(TOKEN_KEY);
-    state.token = null;
-    showLogin('Your session expired. Please sign in again.');
-  }
-  return response;
+// ---- App bootstrap -------------------------------------------------------
+// Velaris is intentionally open: no account or credential handshake is required.
+async function apiFetch(url, opts = {}) {
+  return fetch(url, opts);
 }
 
 function showApp() {
@@ -323,113 +306,10 @@ function showApp() {
   initApp();
 }
 
-function showLogin(message) {
-  document.body.classList.add('logged-out');
-  setAuthMode('login');
-  $('#loginError').textContent = message || '';
-  $('#loginPassword').value = '';
-  setTimeout(() => $('#loginUsername').focus(), 0);
-}
-
-// ---- Login / Create account ------------------------------------------
-// Two entirely separate <form>s (only one visible at a time), rather than
-// one shared form with a conditionally-hidden confirm-password field. That
-// used to leave an inert "new-password" field sitting in the DOM even while
-// signing in, which is exactly the shape that trips up browser password
-// managers into odd autofill/"confirm your password" behavior on login.
-function setAuthMode(mode) {
-  const signingUp = mode === 'signup';
-  $('#loginForm').hidden = signingUp;
-  $('#signupForm').hidden = !signingUp;
-  $('#loginError').textContent = '';
-  $('#signupError').textContent = '';
-}
-
-$('#toSignupLink').addEventListener('click', (e) => { e.preventDefault(); setAuthMode('signup'); });
-$('#toLoginLink').addEventListener('click', (e) => { e.preventDefault(); setAuthMode('login'); });
-
-$('#loginForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const username = $('#loginUsername').value.trim();
-  const password = $('#loginPassword').value;
-  $('#loginError').textContent = '';
-  $('#loginSubmit').disabled = true;
-  try {
-    const r = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
-    });
-    const data = await r.json();
-    if (!r.ok) {
-      if (r.status === 404) {
-        // No accounts exist on this server yet — steer straight to signup instead of a dead-end error.
-        setAuthMode('signup');
-        $('#signupUsername').value = username;
-        $('#signupError').textContent = 'No accounts exist yet — create the first one below.';
-        return;
-      }
-      throw new Error(data.error || 'Sign-in failed.');
-    }
-    state.token = data.token;
-    sessionStorage.setItem(TOKEN_KEY, data.token);
-    showApp();
-  } catch (err) {
-    $('#loginError').textContent = err.message;
-  } finally {
-    $('#loginSubmit').disabled = false;
-  }
-});
-
-$('#signupForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const username = $('#signupUsername').value.trim();
-  const password = $('#signupPassword').value;
-  $('#signupError').textContent = '';
-
-  if (password !== $('#signupConfirm').value) {
-    $('#signupError').textContent = "Passwords don't match.";
-    return;
-  }
-  if (password.length < 8) {
-    $('#signupError').textContent = 'Password must be at least 8 characters.';
-    return;
-  }
-
-  $('#signupSubmit').disabled = true;
-  try {
-    const r = await fetch('/api/signup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
-    });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.error || 'Could not create account.');
-    state.token = data.token;
-    sessionStorage.setItem(TOKEN_KEY, data.token);
-    showApp();
-  } catch (err) {
-    $('#signupError').textContent = err.message;
-  } finally {
-    $('#signupSubmit').disabled = false;
-  }
-});
-
-$('#logoutButton').addEventListener('click', async () => {
-  try { await authFetch('/api/logout', { method: 'POST' }); } catch (e) { /* best-effort */ }
-  sessionStorage.removeItem(TOKEN_KEY);
-  sessionStorage.removeItem(CONV_KEY);
-  state.token = null;
-  state.conversations = {};
-  state.activeId = null;
-  state.history = [];
-  showLogin();
-});
-
 // ---- Config / model list -------------------------------------------------
 async function loadConfig() {
   try {
-    const res = await authFetch('/api/config');
+    const res = await apiFetch('/api/config');
     const cfg = await res.json();
     state.webSearchAvailable = !!cfg.webSearchEnabled;
     const btn = $('#webSearchToggle');
@@ -440,7 +320,7 @@ async function loadConfig() {
 
 async function loadModels() {
   try {
-    const res = await authFetch('/api/models');
+    const res = await apiFetch('/api/models');
     const models = await res.json();
     $('#models').innerHTML = models.map(m => `
       <button class="model-choice" data-id="${escapeHtml(m.id)}" data-name="${escapeHtml(m.name)}">
@@ -564,14 +444,14 @@ async function askModel(promptText) {
   }
 
   try {
-    const r = await authFetch('/api/chat', {
+    const r = await apiFetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt: promptText, model: state.model, history: state.history, web_search: state.webSearch, power: state.power, mode: state.mode }),
       signal: state.controller.signal,
     });
 
-    if (r.status === 401) throw new Error('Your session expired. Please sign in again.');
+    if (r.status === 401) throw new Error('The server rejected the request.');
 
     // A non-streaming, non-JSON body (HTML error page from a proxy/gateway
     // timeout, etc.) should never surface as a raw "Unexpected token '<'".
@@ -680,23 +560,23 @@ async function regenerate(msgIndex, containerEl) {
   await askModel(userMsg.content);
 }
 
-// ---- Assist / Forge mode -------------------------------------------------
+// ---- Assist / Velaris mode -------------------------------------------------
 function setMode(mode) {
-  state.mode = mode === 'forge' ? 'forge' : 'assist';
-  document.querySelectorAll('.mode-tab').forEach(b => b.classList.toggle('active', b.id === (state.mode === 'forge' ? 'forgeMode' : 'assistMode')));
-  const forge = state.mode === 'forge';
-  $('#heroCopy').textContent = forge
+  state.mode = mode === 'velaris' ? 'velaris' : 'assist';
+  document.querySelectorAll('.mode-tab').forEach(b => b.classList.toggle('active', b.id === (state.mode === 'velaris' ? 'velarisMode' : 'assistMode')));
+  const velaris = state.mode === 'velaris';
+  $('#heroCopy').textContent = velaris
     ? 'Build complete, validated files and multi-file projects from one request.'
-    : 'Ask anything, get a clean answer, or switch to Forge for large multi-file builds.';
-  $('#composerHint').textContent = forge
+    : 'Ask anything, get a clean answer, or switch to Velaris for large multi-file builds.';
+  $('#composerHint').textContent = velaris
     ? 'Large builds · documents · slides · spreadsheets · images · 3D · ZIPs'
     : 'Everyday answers, code, research, and quick tasks';
-  promptEl.placeholder = forge ? 'Describe what you want built…' : 'Message Forge…';
+  promptEl.placeholder = velaris ? 'Describe what you want built…' : 'Message Velaris…';
 }
 
 // ---- Wiring & init ------------------------------------------------------
 $('#assistMode').onclick = () => setMode('assist');
-$('#forgeMode').onclick = () => setMode('forge');
+$('#velarisMode').onclick = () => setMode('velaris');
 $('#modelButton').onclick = (e) => { e.stopPropagation(); $('#modelMenu').classList.toggle('open'); };
 $('#modelMenu').onclick = (e) => e.stopPropagation();
 $('#webSearchToggle').onclick = () => {
@@ -738,13 +618,5 @@ function initApp() {
   autoResize();
 }
 
-// A page reload keeps the same tab's sessionStorage, so a valid token found
-// here means "still the same session" — not a persisted auto-login across
-// visits, since sessionStorage never survives the tab/browser closing.
-const existingToken = sessionStorage.getItem(TOKEN_KEY);
-if (existingToken) {
-  state.token = existingToken;
-  showApp();
-} else {
-  showLogin();
-}
+// Velaris opens directly into the assistant.
+showApp();
