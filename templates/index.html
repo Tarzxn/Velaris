@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forge</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body class="logged-out">
+<div class="aurora"><span></span><span></span><span></span><span></span></div>
+
+<div id="loginScreen">
+  <div class="login-card glass">
+    <div class="hero-mark" style="text-align:center">▣</div>
+    <p class="tagline" style="text-align:center;margin:2px 0 0">Making everyday models supercomputers</p>
+
+    <form id="loginForm" class="auth-form">
+      <h1>Sign in to Forge</h1>
+      <p class="auth-subtitle">Your session stays only in this tab — closing it signs you out.</p>
+      <label>Username<input id="loginUsername" type="text" autocomplete="username" required></label>
+      <label>Password<input id="loginPassword" type="password" autocomplete="current-password" required></label>
+      <button type="submit" id="loginSubmit">Sign in</button>
+      <p id="loginError" class="login-error"></p>
+      <p class="auth-switch">Don't have an account? <a href="#" id="toSignupLink">Create one</a></p>
+    </form>
+
+    <form id="signupForm" class="auth-form" hidden>
+      <h1>Create your Forge account</h1>
+      <p class="auth-subtitle">Your session stays only in this tab — closing it signs you out.</p>
+      <label>Username<input id="signupUsername" type="text" autocomplete="username" required></label>
+      <label>Password<input id="signupPassword" type="password" autocomplete="new-password" required></label>
+      <label>Confirm password<input id="signupConfirm" type="password" autocomplete="new-password" required></label>
+      <button type="submit" id="signupSubmit">Create account</button>
+      <p id="signupError" class="login-error"></p>
+      <p class="auth-switch">Already have an account? <a href="#" id="toLoginLink">Sign in</a></p>
+    </form>
+  </div>
+</div>
+
+<div id="app">
+<aside class="glass">
+  <div class="brand"><span class="brand-mark">▣</span> Forge</div>
+  <p class="tagline">Making everyday models supercomputers</p>
+  <div class="mode-switch" role="tablist" aria-label="Forge mode"><button id="assistMode" class="mode-tab active" type="button">Assist</button><button id="forgeMode" class="mode-tab" type="button">Forge</button></div><button class="new" id="newChat"><span>＋</span> New task</button>
+  <p class="label">RECENT</p>
+  <div id="recent"><button class="history active">Current workspace</button></div>
+  <div class="sidebar-foot">
+    Ollama Cloud connected<br><small>Files stay in this workspace.</small>
+    <button id="logoutButton" type="button">Sign out</button>
+  </div>
+</aside>
+<main>
+  <header>
+    <button class="model" id="modelButton"><span class="orb">◆</span><span id="modelName">GPT-OSS 20B</span><span class="chev">⌄</span></button>
+    <div class="model-menu glass" id="modelMenu">
+      <div class="menu-title">Choose a model <small>Ollama Cloud hosted models</small></div>
+      <div id="models"></div>
+    </div>
+    <button class="key-button" id="keyButton" title="Forge uses a server-side Ollama Cloud key — nothing to enter here.">Ollama connected</button>
+  </header>
+
+  <section id="conversation">
+    <div class="hero" id="hero">
+      <div class="hero-mark">▣</div>
+      <h1>What will you create?</h1>
+      <p class="tagline">Making everyday models supercomputers</p>
+      <p id="heroCopy">Ask anything, get a clean answer, or switch to Forge for large multi-file builds.</p>
+      <div class="suggestions">
+        <button class="glass">Build a polished portfolio website</button>
+        <button class="glass">Create a sales presentation</button>
+        <button class="glass">Generate an image of a neon cyberpunk city</button>
+        <button class="glass">Design a printable 3D model of a rocket</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="composer-wrap">
+    <form id="composer" class="glass">
+      <textarea id="prompt" rows="1" placeholder="Message Forge… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <div class="composer-actions">
+        <button id="webSearchToggle" type="button" class="pill-toggle" disabled title="Checking availability…">🔎 Web search</button>
+        <div class="power-select" id="powerSelect" title="How much reasoning effort the model spends before answering">
+          <span class="power-thumb" id="powerThumb"></span>
+          <button type="button" class="power-option" data-power="low" data-index="0">Low</button>
+          <button type="button" class="power-option active" data-power="medium" data-index="1">Medium</button>
+          <button type="button" class="power-option" data-power="high" data-index="2">High</button>
+          <button type="button" class="power-option" data-power="max" data-index="3">Max</button>
+        </div>
+        <span id="composerHint">Everyday answers, code, research, and quick tasks</span>
+        <button id="send" type="submit" aria-label="Send">↑</button>
+      </div>
+    </form>
+    <p class="notice">Review generated files before using them. Enter to send · Shift+Enter for a new line.</p>
+  </div>
+</main>
+</div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
