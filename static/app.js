@@ -8,7 +8,7 @@ const HERO_HTML = $('#hero') ? $('#hero').outerHTML : '';
 const CONV_KEY = 'velaris.conversations';
 
 const state = {
-  model: 'gpt-oss:20b',
+  model: '',
   history: [],
   webSearch: false,
   webSearchAvailable: false,
@@ -52,7 +52,21 @@ function renderReply(text) {
   const flushPara = () => { if (paraBuffer.length) { html += `<p>${paraBuffer.join('<br>')}</p>`; paraBuffer = []; } };
   const closeList = () => { if (listType) { html += `</${listType}>`; listType = null; } };
 
-  for (const line of lines) {
+  const isSep = l => /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l || '') && (l || '').includes('-');
+  const cells = l => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    if (line.trim().startsWith('|') && isSep(lines[li + 1])) {
+      flushPara(); closeList();
+      const head = cells(line); const aligns = cells(lines[li + 1]).map(c => c.startsWith(':') && c.endsWith(':') ? 'center' : c.endsWith(':') ? 'right' : 'left');
+      let rows = ''; li += 2;
+      while (li < lines.length && lines[li].trim().startsWith('|')) {
+        rows += '<tr>' + cells(lines[li]).map((c, i) => `<td style="text-align:${aligns[i] || 'left'}">${inlineMd(c)}</td>`).join('') + '</tr>'; li++;
+      }
+      li--;
+      html += `<div class="md-table-wrap"><table class="md-table"><thead><tr>${head.map((c, i) => `<th style="text-align:${aligns[i] || 'left'}">${inlineMd(c)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>`;
+      continue;
+    }
     const codePlaceholder = line.match(/^\u0000CODEBLOCK(\d+)\u0000$/);
     const heading = line.match(/^(#{1,3})\s+(.*)/);
     const bullet = line.match(/^[-*]\s+(.*)/);
@@ -124,7 +138,7 @@ function workspaceZipUrl(workspace) {
 }
 
 function buildArtifactHtml(data) {
-  if (!data.files || data.files.length === 0) return '';
+  if (!data.workspace || !data.files || data.files.length === 0) return '';
   const images = data.files.filter(f => f.isImage);
   const gallery = images.length ? `
     <div class="artifact-gallery">
@@ -312,6 +326,7 @@ async function loadConfig() {
     const res = await apiFetch('/api/config');
     const cfg = await res.json();
     state.webSearchAvailable = !!cfg.webSearchEnabled;
+    if (cfg.defaultModel) state.model = cfg.defaultModel;
     const btn = $('#webSearchToggle');
     btn.disabled = !state.webSearchAvailable;
     btn.title = state.webSearchAvailable ? 'Search the web before answering' : 'Web search needs a TAVILY_API_KEY set on the server';
@@ -327,7 +342,11 @@ async function loadModels() {
         <strong>${escapeHtml(m.name)}</strong>
         <small>${escapeHtml(m.family)} · ${escapeHtml(m.tag)}</small>
       </button>`).join('');
+    const current = models.find(m => m.id === state.model) || models[0];
+    if (current) { state.model = current.id; $('#modelName').textContent = current.name; }
+    document.querySelectorAll('.model-choice').forEach(b => b.classList.toggle('active', b.dataset.id === state.model));
     document.querySelectorAll('.model-choice').forEach(b => b.onclick = () => {
+      document.querySelectorAll('.model-choice').forEach(x => x.classList.toggle('active', x === b));
       state.model = b.dataset.id;
       $('#modelName').textContent = b.dataset.name;
       $('#modelMenu').classList.remove('open');
@@ -613,8 +632,7 @@ function initApp() {
     rebindSuggestions();
   }
   renderRecentList();
-  loadConfig();
-  loadModels();
+  loadConfig().finally(loadModels);
   autoResize();
 }
 

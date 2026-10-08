@@ -3,6 +3,7 @@ services:
     name: velaris-ollama-cloud
     runtime: python
     buildCommand: pip install -r requirements.txt
+    healthCheckPath: /healthz
     startCommand: gunicorn app:app --workers 1 --worker-class gthread --threads 8 --timeout 420
     envVars:
       - key: PYTHON_VERSION

@@ -38,15 +38,29 @@ All generated paths are restricted to a per-request workspace and delivered as a
 
 ## Models
 
-Velaris deliberately sticks to Ollama's own `gpt-oss` family rather than third-party cloud models (Qwen, DeepSeek, etc.) whose Ollama Cloud offerings churn heavily — DeepSeek's alone has been retired and replaced multiple times (v3.1 → v4-flash → v4-pro) in the time this app has existed. `gpt-oss` has stayed stable:
+Ollama retires and replaces cloud models regularly, so Velaris no longer hardcodes a catalogue. On start-up (and every 10 minutes) it asks Ollama Cloud which models exist (`/api/tags`) and offers:
 
-- **GPT-OSS 20B** (default) — fast, capable, and the best balance of speed vs. quality for interactive use.
-- GPT-OSS 120B — larger, slower, stronger reasoning; also what Velaris auto-switches to for 3D-modeling requests (see below).
+- **GPT-OSS 120B** (default) and **GPT-OSS 20B** — the stable baseline; 120B is also what 3D-modeling requests auto-switch to at Max power.
+- Any newer families found live (Kimi K2, GLM-5, MiniMax M, Qwen Coder, DeepSeek) — shown automatically when Ollama serves them, never when it doesn't.
+
+If the lookup fails, the GPT-OSS baseline is used. Override with env vars `VELARIS_DEFAULT_MODEL` and `VELARIS_BEST_MODEL` (must be models the server lists). The server only accepts model ids from its own catalogue, and retries without `think` if a model family rejects that parameter (only GPT-OSS takes low/medium/high effort levels; other families get on/off).
+
+## File production
+
+All file creation lives in `artifacts.py`; every file is written, then **re-opened with the matching library** (python-docx, openpyxl, python-pptx, Pillow, zipfile, a PDF trailer check, an STL facet check) before it is offered for download, and a failed file never leaves a partial artifact behind.
+
+- **DOCX / PDF** — Markdown: headings, nested bullets, numbered lists, bold/italic/code/links, quotes, rules, code blocks, aligned tables, page numbers.
+- **XLSX** — one or many sheets, real numbers/percentages/currency/dates, safe live formulas, styled frozen header, auto-width columns.
+- **PPTX** — 16:9 deck with title/section/content/table slides, auto-fit and overflow splitting, speaker notes, slide numbers.
+- **Charts** (matplotlib), **images** (Pollinations), **SVG** (sanitised), **ZIP bundles**, **STL** models, text/code of any kind.
+- If the model returns prose instead of the JSON format, or a requested file fails, Velaris builds the requested DOCX/PDF/PPTX/XLSX from the written answer instead of leaving you with nothing.
 
 ## Run locally
 
 1. Install Python 3.12+.
 2. Create a virtual environment and install dependencies: `pip install -r requirements.txt`.
+3. `export OLLAMA_API_KEY=...` (and optionally `TAVILY_API_KEY`), then `python app.py` or `gunicorn app:app`.
+4. `GET /healthz` reports whether the key is configured.
 
 ## Deploy to Render
 
@@ -55,4 +69,8 @@ Push this directory to a Git repository and create a Render Blueprint from it (o
 
 ## Security and privacy
 
-**The Ollama Cloud API key is currently hardcoded as the default value in `app.py`, at the person's explicit request, so the app runs without extra setup.** This is fine for personal/local use but means anyone with access to this source (e.g. if pushed to a public repo) can read and use the key. Before deploying anywhere shared or public, either remove the hardcoded default and require `OLLAMA_API_KEY` to be set, or rotate the key at https://ollama.com/settings/keys if it's ever exposed. The key is never sent to or stored in the browser — only the server holds it. Prompts and generated content are sent to Ollama Cloud (text), Pollinations.ai (image prompts), and — only when you enable the toggle — Tavily (your search query), so do not enter credentials, private keys, regulated data, or sensitive files unless you've reviewed each provider's retention/privacy terms. Workspaces are stored only on the server's ephemeral local disk, pruned automatically after 2 hours, and reachable through the unguessable 128-bit workspace ID — but they are not encrypted at rest.
+The Ollama Cloud key is **never** stored in the source: set `OLLAMA_API_KEY` as an environment variable (Render: Environment tab, non-synced). If a key was ever committed to a public repo, rotate it at https://ollama.com/settings/keys.
+
+Velaris is open-access (no login), so anyone with the URL spends your Ollama quota. Built-in protections: a per-IP rate limit (`VELARIS_RATE_LIMIT_PER_MIN`, default 12, `0` disables), a 20,000-character prompt cap, history sanitising (only user/assistant turns are accepted from the browser), a server-side model allow-list, inline previews restricted to sandboxed images, and sanitised SVG. Put it behind your own auth or a private URL if it is deployed publicly.
+
+Prompts and generated content go to Ollama Cloud (text), Pollinations.ai (image prompts) and, only when the toggle is on, Tavily (your search query) — don't enter credentials or regulated data. Workspaces live on the server's ephemeral disk, are pruned after 2 hours, are reachable only via an unguessable 128-bit ID, and are not encrypted at rest.
