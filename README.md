@@ -36,6 +36,18 @@ Velaris is open-access: it launches directly into the assistant. There is no log
 
 All generated paths are restricted to a per-request workspace and delivered as a ZIP, with individual files also downloadable (or, for images/SVGs, previewable) on their own.
 
+## 3D modelling (CAD engine)
+
+`cad_engine.py` runs a real solid-modelling kernel ([Manifold](https://github.com/elalish/manifold), via `manifold3d`) instead of stacking loose primitives. The model writes a JSON CSG tree; Velaris evaluates it exactly:
+
+- **Shapes:** box, rounded_box, sphere, cylinder/cone (tapers), tube, torus, capsule, wedge, pyramid, prism (hex nuts…), gear, star, `extrude` (any 2D outline with holes, twist, taper) and `revolve` (lathe profile → vases, cups, bottles, knobs, chess pieces).
+- **Operations:** union, difference (holes, slots, hollowing), intersection, hull, radial/linear `repeat`, `mirror`.
+- **Output:** a *binary* STL that is watertight by construction, **independently re-checked** (closed surface, outward faces, positive volume), centred and set on the build plate (min Z = 0), plus a smooth-shaded `*-preview.png`. Absurd sizes are rescaled; disconnected pieces and skipped parts are reported.
+- **Self-repair:** if a 3D program fails or builds with problems, Velaris shows the model the exact error and asks for a corrected version (one automatic round) before telling you anything went wrong. The same loop covers every other file type.
+- If `manifold3d` can't be installed, it falls back to the older primitive-assembly STL engine.
+
+Quality still depends on the model you pick: GPT-OSS 120B at High/Max power (what 3D requests auto-select) is the best default; larger cloud models do better on complex organic shapes.
+
 ## Models
 
 Ollama retires and replaces cloud models regularly, so Velaris no longer hardcodes a catalogue. On start-up (and every 10 minutes) it asks Ollama Cloud which models exist (`/api/tags`) and offers:

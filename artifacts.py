@@ -24,6 +24,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 import requests
 
+import cad_engine
 from stl_engine import render_ascii_stl, run_stl_program, safe_path
 
 ARTIFACT_KINDS = {"text", "base64", "image", "chart", "docx", "xlsx", "pptx", "pdf", "stl", "zip"}
@@ -1260,7 +1261,12 @@ def _write_item(root, item, prompt="", depth=0):
     elif kind == "zip":
         return _write_zip(root, path, content, prompt, depth)
     elif kind == "stl":
-        triangles, warnings = run_stl_program(_parse_json_content(content))
+        spec = _parse_json_content(content)
+        if cad_engine.AVAILABLE:
+            # Real CSG kernel: guaranteed watertight, binary STL + shaded preview image.
+            notes, _info = cad_engine.build_files(path, spec, path.with_name(path.stem + "-preview.png"))
+            return notes
+        triangles, warnings = run_stl_program(spec)  # legacy primitive-assembly fallback
         if not triangles:
             raise ValueError("The 3D build program produced no geometry")
         path.write_text(render_ascii_stl(triangles), encoding="ascii")
@@ -1306,10 +1312,11 @@ def validate_artifact(path, kind):
             if archive.testzip() is not None or not archive.namelist():
                 raise ValueError("Generated ZIP is corrupt or empty")
     elif kind == "stl":
-        head = data[:2000].lower()
-        facets = data.lower().count(b"facet normal")
-        if not head.startswith(b"solid") or facets < 4 or b"nan" in data.lower():
-            raise ValueError("Generated STL is empty or malformed")
+        if data[:5].lower() == b"solid" and b"facet normal" in data[:400]:  # ASCII (legacy engine)
+            if data.lower().count(b"facet normal") < 4 or b"nan" in data.lower():
+                raise ValueError("Generated STL is empty or malformed")
+        else:
+            cad_engine.verify_binary_stl(path)
     return len(data)
 
 
@@ -1329,6 +1336,8 @@ def produce_artifact(root, raw_item, prompt=""):
         raise ValueError(f"its content was not valid JSON ({error.msg} at position {error.pos})")
     except Exception:
         target.unlink(missing_ok=True)
+        if item["kind"] == "stl":
+            target.with_name(target.stem + "-preview.png").unlink(missing_ok=True)
         raise
     return {"path": item["path"], "kind": item["kind"], "bytes": size, "warnings": warnings}
 
