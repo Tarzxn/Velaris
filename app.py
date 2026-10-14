@@ -126,7 +126,7 @@ def best_model_id():
     wanted = os.environ.get("VELARIS_BEST_MODEL", "").strip()
     ids = [m["id"] for m in get_models()]
     if wanted and wanted in ids: return wanted
-    for prefix in ("nemotron-3-ultra", "gpt-oss:120b"):
+    for prefix in ("nemotron-3-super", "gpt-oss:120b"):
         found = [i for i in ids if i.startswith(prefix)]
         if found: return found[0]
     return ids[0]
