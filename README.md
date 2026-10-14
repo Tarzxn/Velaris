@@ -36,6 +36,18 @@ Velaris is open-access: it launches directly into the assistant. There is no log
 
 All generated paths are restricted to a per-request workspace and delivered as a ZIP, with individual files also downloadable (or, for images/SVGs, previewable) on their own.
 
+## Interface
+
+The UI is modelled on ChatGPT (chat) and Codex (builds), with dark/light/system themes:
+
+- **Sidebar:** new chat, search, history grouped Today / Yesterday / Previous 7 days…, rename and delete, collapsible (drawer on mobile). `Ctrl/Cmd+K` searches, `Ctrl/Cmd+Shift+O` starts a new chat.
+- **Composer:** centred on a fresh chat, docks to the bottom once you start; **+** menu toggles *Web search* and *Build files* (Codex mode); Enter sends, Shift+Enter adds a line, the send button becomes **Stop** while generating.
+- **Replies:** streamed Markdown with tables, nested lists, syntax-highlighted code and Copy buttons; collapsible *Thought for Ns* and *Worked for Ns* steps; copy / 👍 / 👎 / regenerate; double-click your own message to edit and resend.
+- **Model picker:** top-left, with reasoning effort (Low–Max). Models come from Ollama Cloud only (see Models).
+- **Files panel (Codex-style):** click any generated file to open it beside the chat — live sandboxed **HTML preview**, code view, Word/Excel/PowerPoint previews, PDF viewer, images, ZIP contents, and an interactive **WebGL 3D viewer** for STL models (drag to rotate, scroll to zoom).
+
+Chats are stored in this browser's `localStorage` only (clear them from the profile menu). Generated files stay on the server for 2 hours, after which their cards show as expired. `/api/inspect/<id>/<file>` provides the structured previews.
+
 ## 3D modelling (CAD engine)
 
 `cad_engine.py` runs a real solid-modelling kernel ([Manifold](https://github.com/elalish/manifold), via `manifold3d`) instead of stacking loose primitives. The model writes a JSON CSG tree; Velaris evaluates it exactly:
@@ -85,4 +97,4 @@ The Ollama Cloud key is **never** stored in the source: set `OLLAMA_API_KEY` as 
 
 Velaris is open-access (no login), so anyone with the URL spends your Ollama quota. Built-in protections: a per-IP rate limit (`VELARIS_RATE_LIMIT_PER_MIN`, default 12, `0` disables), a 20,000-character prompt cap, history sanitising (only user/assistant turns are accepted from the browser), a server-side model allow-list, inline previews restricted to sandboxed images, and sanitised SVG. Put it behind your own auth or a private URL if it is deployed publicly.
 
-Prompts and generated content go to Ollama Cloud (text), Pollinations.ai (image prompts) and, only when the toggle is on, Tavily (your search query) — don't enter credentials or regulated data. Workspaces live on the server's ephemeral disk, are pruned after 2 hours, are reachable only via an unguessable 128-bit ID, and are not encrypted at rest.
+Chat history is kept in your browser's localStorage (never on the server). Prompts and generated content go to Ollama Cloud (text), Pollinations.ai (image prompts) and, only when the toggle is on, Tavily (your search query) — don't enter credentials or regulated data. Workspaces live on the server's ephemeral disk, are pruned after 2 hours, are reachable only via an unguessable 128-bit ID, and are not encrypted at rest.

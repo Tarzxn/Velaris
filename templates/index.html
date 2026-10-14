@@ -1,69 +1,125 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
 <title>Velaris</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23111'/%3E%3Cpath d='M8 9l8 15 8-15' fill='none' stroke='%23fff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<script>
+  // Apply the saved theme before first paint so there is no light/dark flash.
+  (function () {
+    try {
+      var pref = localStorage.getItem('velaris.theme') || 'system';
+      var dark = pref === 'dark' || (pref === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    } catch (e) {}
+  })();
+</script>
 <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
-<body>
-<div class="aurora"><span></span><span></span><span></span><span></span></div>
+<body class="empty">
+<div id="app" class="app">
 
-<div id="app">
-<aside class="glass">
-  <div class="brand"><span class="brand-mark">▣</span> Velaris</div>
-  <p class="tagline">Making everyday models supercomputers</p>
-  <div class="mode-switch" role="tablist" aria-label="Velaris mode"><button id="assistMode" class="mode-tab active" type="button">Assist</button><button id="velarisMode" class="mode-tab" type="button">Velaris</button></div><button class="new" id="newChat"><span>＋</span> New task</button>
-  <p class="label">RECENT</p>
-  <div id="recent"><button class="history active">Current workspace</button></div>
-  <div class="sidebar-foot">
-    Ollama Cloud connected<br><small>Files stay in this workspace.</small>
-  </div>
-</aside>
-<main>
-  <header>
-    <button class="model" id="modelButton"><span class="orb">◆</span><span id="modelName">Loading…</span><span class="chev">⌄</span></button>
-    <div class="model-menu glass" id="modelMenu">
-      <div class="menu-title">Choose a model <small>Ollama Cloud hosted models</small></div>
-      <div id="models"></div>
+  <!-- ───────────── Sidebar ───────────── -->
+  <aside id="sidebar" class="sidebar" aria-label="Sidebar">
+    <div class="sb-top">
+      <button class="icon-btn logo-btn" id="logoBtn" aria-label="Velaris home" title="Velaris"><span data-icon="logo"></span></button>
+      <button class="icon-btn" id="collapseBtn" aria-label="Close sidebar" title="Close sidebar"><span data-icon="sidebar"></span></button>
     </div>
-    <button class="key-button" id="keyButton" title="Velaris uses a server-side Ollama Cloud key — nothing to enter here.">Ollama connected</button>
-  </header>
-
-  <section id="conversation">
-    <div class="hero" id="hero">
-      <div class="hero-mark">▣</div>
-      <h1>What will you create?</h1>
-      <p class="tagline">Making everyday models supercomputers</p>
-      <p id="heroCopy">Ask anything, get a clean answer, or switch to Velaris for large multi-file builds.</p>
-      <div class="suggestions">
-        <button class="glass">Build a polished portfolio website</button>
-        <button class="glass">Create a sales presentation</button>
-        <button class="glass">Generate an image of a neon cyberpunk city</button>
-        <button class="glass">Design a printable 3D model of a rocket</button>
+    <div class="sb-nav">
+      <button class="sb-item" id="newChat"><span data-icon="compose"></span><span>New chat</span></button>
+      <label class="sb-search"><span data-icon="search"></span><input id="chatSearch" type="search" placeholder="Search chats" autocomplete="off" spellcheck="false"></label>
+    </div>
+    <div id="recent" class="sb-list" role="list"></div>
+    <div class="sb-foot">
+      <div id="profileMenu" class="menu up" role="menu">
+        <div class="menu-label">Appearance</div>
+        <button class="menu-row" data-theme-set="system"><span data-icon="monitor"></span>System<span class="check" data-icon="check"></span></button>
+        <button class="menu-row" data-theme-set="light"><span data-icon="sun"></span>Light<span class="check" data-icon="check"></span></button>
+        <button class="menu-row" data-theme-set="dark"><span data-icon="moon"></span>Dark<span class="check" data-icon="check"></span></button>
+        <div class="menu-sep"></div>
+        <button class="menu-row danger" id="clearAll"><span data-icon="trash"></span>Clear all chats</button>
       </div>
+      <button class="profile" id="profileBtn" aria-haspopup="menu">
+        <span class="avatar">V</span>
+        <span class="profile-text"><b>Velaris</b><small>Ollama Cloud</small></span>
+        <span data-icon="more"></span>
+      </button>
     </div>
-  </section>
+  </aside>
+  <div id="scrim" class="scrim"></div>
 
-  <div class="composer-wrap">
-    <form id="composer" class="glass">
-      <textarea id="prompt" rows="1" placeholder="Message Velaris… (Enter to send, Shift+Enter for a new line)"></textarea>
-      <div class="composer-actions">
-        <button id="webSearchToggle" type="button" class="pill-toggle" disabled title="Checking availability…">🔎 Web search</button>
-        <div class="power-select" id="powerSelect" title="How much reasoning effort the model spends before answering">
-          <span class="power-thumb" id="powerThumb"></span>
-          <button type="button" class="power-option" data-power="low" data-index="0">Low</button>
-          <button type="button" class="power-option active" data-power="medium" data-index="1">Medium</button>
-          <button type="button" class="power-option" data-power="high" data-index="2">High</button>
-          <button type="button" class="power-option" data-power="max" data-index="3">Max</button>
+  <!-- ───────────── Main ───────────── -->
+  <main class="main" id="main">
+    <header class="topbar">
+      <button class="icon-btn open-sidebar" id="openSidebar" aria-label="Open sidebar" title="Open sidebar"><span data-icon="sidebar"></span></button>
+      <div class="model-wrap">
+        <button class="model-btn" id="modelButton" aria-haspopup="menu" aria-expanded="false">
+          <span id="modelName">Velaris</span><span class="model-sub" id="modelSub"></span><span data-icon="chevron"></span>
+        </button>
+        <div class="menu model-menu" id="modelMenu" role="menu">
+          <div class="menu-label">Model</div>
+          <div id="models"></div>
+          <div class="menu-sep"></div>
+          <div class="menu-label">Reasoning effort</div>
+          <div class="effort" id="powerSelect" role="radiogroup" aria-label="Reasoning effort">
+            <button type="button" class="effort-opt" data-power="low" role="radio">Low</button>
+            <button type="button" class="effort-opt active" data-power="medium" role="radio">Medium</button>
+            <button type="button" class="effort-opt" data-power="high" role="radio">High</button>
+            <button type="button" class="effort-opt" data-power="max" role="radio">Max</button>
+          </div>
+          <p class="menu-hint">Higher effort thinks longer before answering. 3D models always use Max.</p>
         </div>
-        <span id="composerHint">Everyday answers, code, research, and quick tasks</span>
-        <button id="send" type="submit" aria-label="Send">↑</button>
       </div>
-    </form>
-    <p class="notice">Review generated files before using them. Enter to send · Shift+Enter for a new line.</p>
-  </div>
-</main>
+      <div class="top-actions">
+        <button class="icon-btn" id="themeBtn" aria-label="Toggle theme" title="Toggle theme"><span data-icon="sun"></span></button>
+      </div>
+    </header>
+
+    <section id="scroller" class="scroller" aria-live="polite">
+      <div id="conversation" class="thread"></div>
+    </section>
+    <button id="jump" class="jump" aria-label="Scroll to latest"><span data-icon="arrowdown"></span></button>
+
+    <div class="stage">
+      <h1 class="hero" id="heroTitle">What can I help with?</h1>
+      <div class="composer-zone">
+        <form id="composer" class="composer" autocomplete="off">
+          <div class="chips" id="chips"></div>
+          <textarea id="prompt" rows="1" placeholder="Ask anything" aria-label="Message Velaris"></textarea>
+          <div class="composer-row">
+            <div class="plus-wrap">
+              <button type="button" class="icon-btn round" id="plusBtn" aria-label="Add tools" aria-haspopup="menu"><span data-icon="plus"></span></button>
+              <div class="menu up" id="plusMenu" role="menu">
+                <button type="button" class="menu-row" id="toggleSearch"><span data-icon="globe"></span><span class="grow">Web search</span><span class="switch"></span></button>
+                <button type="button" class="menu-row" id="toggleBuild"><span data-icon="code"></span><span class="grow">Build files <small>(Codex mode)</small></span><span class="switch"></span></button>
+              </div>
+            </div>
+            <span class="grow"></span>
+            <button id="send" type="submit" class="send" aria-label="Send message" disabled><span data-icon="arrowup"></span></button>
+          </div>
+        </form>
+        <div class="suggestions" id="suggestions"></div>
+        <p class="fineprint">Velaris can make mistakes. Check important info and review generated files before using them.</p>
+      </div>
+    </div>
+  </main>
+
+  <!-- ───────────── Files panel (Codex-style) ───────────── -->
+  <aside id="panel" class="panel" aria-label="File preview" aria-hidden="true">
+    <div class="panel-head">
+      <div class="panel-tabs" id="panelFiles" role="tablist"></div>
+      <button class="icon-btn" id="panelClose" aria-label="Close panel"><span data-icon="x"></span></button>
+    </div>
+    <div class="panel-bar">
+      <div class="seg" id="panelModes"></div>
+      <span class="grow"></span>
+      <button class="ghost-btn" id="panelCopy"><span data-icon="copy"></span><span>Copy</span></button>
+      <a class="ghost-btn" id="panelDownload" download><span data-icon="download"></span><span>Download</span></a>
+    </div>
+    <div class="panel-body" id="panelBody"></div>
+  </aside>
 </div>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>

@@ -58,10 +58,22 @@ _model_cache = {"at": 0.0, "models": list(BASE_MODELS)}
 _model_lock = threading.Lock()
 
 
+_ACRONYMS = {"gpt": "GPT", "oss": "OSS", "glm": "GLM", "llm": "LLM", "ai": "AI", "minimax": "MiniMax", "deepseek": "DeepSeek", "qwen": "Qwen", "kimi": "Kimi"}
+
+
+def _pretty_word(word):
+    low = word.lower()
+    if low in _ACRONYMS: return _ACRONYMS[low]
+    if re.fullmatch(r"\d+(\.\d+)?b", low): return low.upper()
+    return word[:1].upper() + word[1:]
+
+
 def _pretty_model_name(model_id):
-    base = model_id.split(":")[0].replace("-", " ").title()
-    variant = model_id.split(":", 1)[1] if ":" in model_id else ""
-    return f"{base} {variant}".strip().replace(" Cloud", "")
+    base, _, variant = model_id.partition(":")
+    variant = re.sub(r"-?cloud$", "", variant.lower()).strip("-")
+    words = [_pretty_word(w) for w in re.split(r"[-_]", base) if w and w.lower() != "cloud"]
+    if variant and variant != "latest": words.append(_pretty_word(variant))
+    return " ".join(words) or model_id
 
 
 def get_models(force=False):
@@ -620,6 +632,8 @@ def chat():
 
             raw_files = result.get("files", [])
             if not isinstance(raw_files, list): raw_files = []
+            if raw_files:
+                yield json.dumps({"type": "status", "text": f"Building {min(len(raw_files), 50)} file{'s' if len(raw_files) != 1 else ''}"}) + "\n"
             workspace_id = uuid.uuid4().hex; root = WORKSPACES / workspace_id; root.mkdir()
             notes, created, problems = [], [], []
             for raw_item in raw_files[:50]:
@@ -640,7 +654,7 @@ def chat():
 
             # One automatic self-correction round for anything that failed or built flawed.
             if problems and not truncated:
-                yield json.dumps({"type": "info", "text": "Some files had problems — asking the model to fix them…"}) + "\n"
+                yield json.dumps({"type": "status", "text": "Fixing problems found while verifying files"}) + "\n"
                 fixes = repair_files(model_id, power_config, prompt, [(p[0], p[1]) for p in problems])
                 fixed_paths = {}
                 for fix in fixes[:3]:
@@ -688,6 +702,8 @@ def chat():
                         notes.append(f"⚠️ Fallback {kind.upper()} failed too: {error}")
                 notes.append(f"❌ No {kind.upper()} file was created. Please press Regenerate; if it keeps failing, try Power: High or another model.")
 
+            if created:
+                yield json.dumps({"type": "status", "text": "Verified files open correctly"}) + "\n"
             manifest = sorted(
                 [{"path": p.relative_to(root).as_posix(), "bytes": p.stat().st_size,
                   "isImage": p.suffix.lower() in IMAGE_EXTENSIONS}
@@ -743,15 +759,83 @@ def download_single(workspace_id, filename):
     return send_file(target, as_attachment=True, download_name=target.name, mimetype=guessed)
 
 
+TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".html", ".htm", ".css", ".json", ".csv", ".tsv",
+                   ".xml", ".svg", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".sh", ".bat", ".sql", ".c", ".h", ".cpp", ".hpp",
+                   ".java", ".kt", ".go", ".rs", ".rb", ".php", ".swift", ".lua", ".r", ".tex", ".log", ".env", ".gitignore"}
+INSPECT_TEXT_LIMIT = 300_000
+
+
+@app.get("/api/inspect/<workspace_id>/<path:filename>")
+def inspect_file(workspace_id, filename):
+    """Structured, read-only preview data for the side panel: text/code, Word
+    outline, spreadsheet cells, slide outline, zip listing, or a type tag."""
+    target = resolve_workspace_file(workspace_id, filename)
+    ext, size = target.suffix.lower(), target.stat().st_size
+    base = {"path": filename, "bytes": size, "ext": ext}
+    try:
+        if ext in TEXT_EXTENSIONS or target.name.lower() in ("dockerfile", "makefile", "readme"):
+            text = target.read_bytes()[:INSPECT_TEXT_LIMIT].decode("utf-8", errors="replace")
+            return jsonify(**base, kind="text", text=text, truncated=size > INSPECT_TEXT_LIMIT)
+        if ext == ".docx":
+            import docx
+            document = docx.Document(str(target))
+            blocks = [{"style": p.style.name if p.style is not None else "", "text": p.text} for p in document.paragraphs if p.text.strip()][:400]
+            tables = []
+            for table in document.tables[:5]:
+                tables.append([[cell.text.strip()[:80] for cell in row.cells][:12] for row in table.rows[:40]])
+            return jsonify(**base, kind="docx", blocks=blocks, tables=tables)
+        if ext == ".xlsx":
+            import openpyxl
+            workbook = openpyxl.load_workbook(str(target), read_only=True, data_only=False)
+            sheets = []
+            for sheet in workbook.worksheets[:8]:
+                rows = []
+                for row in sheet.iter_rows(min_row=1, max_row=60, max_col=20, values_only=True):
+                    rows.append(["" if v is None else str(v)[:80] for v in row])
+                sheets.append({"name": sheet.title, "rows": rows})
+            workbook.close()
+            return jsonify(**base, kind="sheet", sheets=sheets)
+        if ext == ".pptx":
+            from pptx import Presentation
+            deck = Presentation(str(target))
+            slides = []
+            for slide in deck.slides:
+                title, bullets = "", []
+                for shape in slide.shapes:
+                    if not shape.has_text_frame: continue
+                    lines = [p.text.strip() for p in shape.text_frame.paragraphs if p.text.strip()]
+                    if not lines: continue
+                    if not title and getattr(shape, "is_placeholder", False) and "TITLE" in str(shape.placeholder_format.type):
+                        title = lines[0]; bullets += lines[1:]
+                    else:
+                        bullets += lines
+                if not title and bullets: title, bullets = bullets[0], bullets[1:]
+                slides.append({"title": title, "bullets": bullets[:12]})
+            return jsonify(**base, kind="slides", slides=slides[:80])
+        if ext == ".zip":
+            with zipfile.ZipFile(target) as archive:
+                entries = [{"name": i.filename, "bytes": i.file_size} for i in archive.infolist()[:300]]
+            return jsonify(**base, kind="zip", entries=entries)
+    except Exception as error:  # a preview must never break the download
+        return jsonify(**base, kind="binary", note=f"Preview unavailable ({type(error).__name__}).")
+    if ext in IMAGE_EXTENSIONS: return jsonify(**base, kind="image")
+    if ext == ".pdf": return jsonify(**base, kind="pdf")
+    if ext == ".stl": return jsonify(**base, kind="stl")
+    return jsonify(**base, kind="binary")
+
+
 @app.get("/api/preview/<workspace_id>/<path:filename>")
 def preview_single(workspace_id, filename):
-    # Inline preview is limited to images. SVG is additionally sandboxed so it
-    # can never run script in the app's origin; HTML/other types are refused.
+    # Inline viewing is limited to images (SVG additionally sandboxed so it can
+    # never run script in the app's origin) and PDFs. Everything else is
+    # inspected through /api/inspect or downloaded.
     target = resolve_workspace_file(workspace_id, filename)
-    if target.suffix.lower() not in IMAGE_EXTENSIONS: abort(404)
+    ext = target.suffix.lower()
+    if ext not in IMAGE_EXTENSIONS and ext != ".pdf": abort(404)
     mimetype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     response = send_file(target, as_attachment=False, mimetype=mimetype)
-    response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox"
+    if ext != ".pdf":
+        response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
 
