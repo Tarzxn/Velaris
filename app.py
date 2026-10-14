@@ -1,4 +1,5 @@
 """Velaris (Gen 2) — an Ollama Cloud-powered, downloadable file workspace."""
+import base64
 import io
 import shutil
 import json
@@ -46,13 +47,19 @@ BASE_MODELS = [
     {"id": "gpt-oss:20b", "name": "GPT-OSS 20B", "family": "OpenAI OSS", "tag": "Fast · light tasks"},
 ]
 # (name prefix, display family, tag) — checked against the live catalogue.
-DISCOVERABLE_FAMILIES = [
-    ("kimi-k2", "Moonshot Kimi", "Newer · strong at structured builds"),
-    ("glm-5", "Zhipu GLM", "Newer · strong coding & documents"),
-    ("minimax-m", "MiniMax", "Newer · long-form generation"),
-    ("qwen3-coder", "Qwen Coder", "Code-focused"),
-    ("deepseek-v", "DeepSeek", "Heavy · deep reasoning"),
+FREE_FAMILIES = [
+    ("nemotron-3-ultra", "NVIDIA Nemotron", "Free · most capable · 1M-token context"),
+    ("nemotron-3-super", "NVIDIA Nemotron", "Free · strong reasoning"),
+    ("gemma4:31b", "Google Gemma", "Free · multimodal (reads images)"),
 ]
+PAID_FAMILIES = [  # listed on Ollama Cloud but need a paid plan; hidden unless VELARIS_SHOW_PAID_MODELS=1
+    ("kimi-k2", "Moonshot Kimi", "Paid plan · strong at structured builds"),
+    ("glm-5", "Zhipu GLM", "Paid plan · strong coding & documents"),
+    ("minimax-m", "MiniMax", "Paid plan · long-form generation"),
+    ("qwen3-coder", "Qwen Coder", "Paid plan · code-focused"),
+    ("deepseek-v", "DeepSeek", "Paid plan · deep reasoning"),
+]
+DISCOVERABLE_FAMILIES = FREE_FAMILIES + (PAID_FAMILIES if os.environ.get("VELARIS_SHOW_PAID_MODELS", "").lower() in ("1", "true", "yes") else [])
 MODEL_CACHE_SECONDS = 600
 _model_cache = {"at": 0.0, "models": list(BASE_MODELS)}
 _model_lock = threading.Lock()
@@ -114,11 +121,37 @@ def default_model_id():
 
 
 def best_model_id():
+    """Model used for 3D builds: the most capable free model Ollama lists
+    (Nemotron 3 Ultra), else GPT-OSS 120B. Override with VELARIS_BEST_MODEL."""
     wanted = os.environ.get("VELARIS_BEST_MODEL", "").strip()
     ids = [m["id"] for m in get_models()]
     if wanted and wanted in ids: return wanted
-    big = [i for i in ids if i.startswith("gpt-oss:120b")]
-    return big[0] if big else ids[0]
+    for prefix in ("nemotron-3-ultra", "gpt-oss:120b"):
+        found = [i for i in ids if i.startswith(prefix)]
+        if found: return found[0]
+    return ids[0]
+
+
+def fallback_model_id(exclude):
+    """A proven model to fall back on when the chosen one is unavailable or its build failed."""
+    ids = [m["id"] for m in get_models()]
+    for prefix in ("gpt-oss:120b", "nemotron-3-super", "gpt-oss:20b"):
+        for i in ids:
+            if i.startswith(prefix) and i != exclude: return i
+    others = [i for i in ids if i != exclude]
+    return others[0] if others else None
+
+
+def vision_model_id():
+    """A multimodal model for visually checking 3D renders (Gemma 4 is free and reads images)."""
+    wanted = os.environ.get("VELARIS_VISION_MODEL", "").strip()
+    ids = [m["id"] for m in get_models()]
+    if wanted and wanted in ids: return wanted
+    found = [i for i in ids if i.startswith("gemma4")]
+    return found[0] if found else None
+
+
+VISION_CRITIC = os.environ.get("VELARIS_VISION_CRITIC", "1").lower() not in ("0", "false", "no")
 
 
 # ---- Power level (Low/Medium/High/Max reasoning effort) ----------------------
@@ -192,16 +225,17 @@ Kinds:
 - chart: a real chart from real numbers, path ending .png. content is JSON: {"type":"bar|line|pie|scatter","title":"...","x_label":"...","y_label":"...","labels":["A","B","C"],"series":[{"name":"Series 1","values":[1,2,3]}]}.
 - zip: a bundle. content is a JSON list [{"path":"src/app.py","kind":"text","content":"..."}, ...] of any non-zip kinds. Use zip only when the user asks for an archive; otherwise list the files separately.
 
-For a 3D model, use kind "stl" with a .stl path. You are a mechanical/industrial CAD engineer with a real solid-modelling kernel (exact boolean union/difference/intersection, extrusion, revolution). Velaris executes your JSON program, guarantees a watertight printable solid, and shows a rendered preview. content is JSON: {"plan":"...","tree":NODE}.
-FIRST write "plan": the real-world object, its overall size in mm, each distinct part with its dimensions, wall thickness (>=2 mm for anything printable), and exactly how parts attach (shared axis/face, overlap by >=1 mm so they fuse). Units are millimetres, +Z is up. The finished model is auto-centred and set on the build plate; keep the object roughly 20-200 mm.
+For a 3D model, use kind "stl" with a .stl path. You are a senior mechanical/industrial-design CAD engineer with a real solid-modelling kernel (exact boolean union/difference/intersection, extrusion, revolution, filleting, shelling, lettering). Velaris executes your JSON program, guarantees a watertight printable solid, renders a multi-view preview and checks it. content is JSON: {"plan":"...","tree":NODE}.
+WORKFLOW: (1) In "plan", name the real object, its overall size in mm, then list each part with dimensions, wall thickness (>= 2 mm for printable walls) and how it attaches (shared axis/face, overlapping >= 1 mm so it fuses into ONE solid). (2) Build the tree from those parts. (3) Add the details that make it look real and professional: fillets (round), chamfers, mounting holes, lips, ribs, feet, handles, text. Units are millimetres, +Z is up; the finished model is auto-centred and set on the build plate; aim for 20-200 mm overall.
 Every NODE may carry "position":[x,y,z], "rotation":[rx,ry,rz] (degrees, X then Y then Z), "scale":number|[sx,sy,sz], and "anchor":"bottom" (sit the shape's base on z=0 before positioning). Shapes are centred on their own origin unless anchored.
-SHAPES: {"shape":"box","size":[w,d,h]} | "rounded_box" (+"radius": softened edges) | "sphere" ("radius") | "cylinder" ("radius","height", optional "radius_top" for a taper) | "cone" | "tube" ("radius","inner_radius","height": hollow pipe/ring/washer) | "torus" ("radius","tube") | "capsule" ("radius","height" = straight section) | "wedge" ("size", slopes down along +x) | "pyramid" | "prism" ("sides","radius","height": hex nut/bolt head, any regular polygon) | "gear" ("teeth","radius","height","tooth_depth") | "star" ("points","radius","inner_radius","height") | "extrude" ("points":[[x,y],...], optional "holes":[[[x,y],...]], "height", optional "twist" degrees, "scale_top": any 2D outline pushed up: L-brackets, plates with cut-outs, logos, cams, I-beams) | "revolve" ("profile":[[radius,z],...] lathe-turned around the Z axis: vases, cups, bottles, bowls, knobs, lamp shades, chess pieces, wheels; list the outer wall bottom-to-top then the inner wall back down for hollow forms, radius >= 0).
-OPERATIONS: {"op":"union","children":[...]} fuses parts | {"op":"difference","children":[BASE, CUTTER, CUTTER...]} subtracts everything after the first (holes, slots, pockets, hollowing, countersinks) | {"op":"intersection","children":[...]} | {"op":"hull","children":[...]} smooth convex skin over shapes (streamlined bodies, rounded blobs, tapered housings) | {"op":"repeat","child":NODE,"count":6,"rotate":[0,0,60],"around":[0,0,0]} radial pattern | same with "translate":[dx,dy,dz] for linear patterns (rows of holes, fins, stairs, slats) | {"op":"mirror","child":NODE,"axis":"x","offset":0} symmetric copy kept alongside the original.
-DESIGN RULES: build ONE finished object, not loose parts: everything must overlap or touch so the union is a single piece. Make cutters taller/longer than the material they cut (extend 1-2 mm past each face) so no faces are coplanar. Lay a cylinder along X with rotation [0,90,0], along Y with [90,0,0]. A hollow thing is a difference, never a solid. Use real proportions (mug: 80 mm tall, 75 mm wide, 3 mm walls; M5 screw hole radius 2.75; bracket plate 3-5 mm thick). Add the details that make it look real: fillets via rounded_box, mounting holes, chamfers via cones, ribs, handles, feet, lips. A wedge is a right-triangle prism (size [length,thickness,height], tallest at its -x end): rotate it [0,0,90] to make a gusset that braces an inside corner. Typically 8-30 nodes. A node that fails is skipped and reported, so never leave parts to chance.
-EXAMPLE (mug): {"plan":"80mm tall, 76mm wide cup, 3mm wall, 4mm floor, D-handle fused to the side","tree":{"op":"union","children":[{"op":"difference","children":[{"shape":"cylinder","radius":38,"height":80},{"shape":"cylinder","radius":35,"height":80,"position":[0,0,4]}]},{"op":"difference","children":[{"shape":"torus","radius":17,"tube":4.5,"rotation":[90,0,0],"position":[38,0,5]},{"shape":"cylinder","radius":30,"height":20,"position":[0,0,5]}]}]}}
+SHAPES: {"shape":"box","size":[w,d,h]} | "rounded_box" (+"radius") | "plate" ("size":[w,d,thickness],"corner_radius": flat slab with rounded corners: tags, signs, bases, trays) | "sphere" ("radius"; use "scale":[sx,sy,sz] for ellipsoids) | "cylinder" ("radius","height", optional "radius_top" for a taper) | "cone" | "tube" ("radius","inner_radius","height": pipe/ring/washer) | "torus" ("radius","tube") | "capsule" ("radius","height") | "wedge" ("size", right-triangle prism, tallest at -x) | "pyramid" | "prism" ("sides","radius","height", optional "round": hex nuts/bolt heads, any regular polygon) | "gear" ("teeth","radius","height","tooth_depth") | "star" ("points","radius","inner_radius","height") | "text" ("text","size","height","bold": real 3D lettering lying flat in XY, centred; rotate [90,0,0] to stand it on a vertical face) | "extrude" ("points":[[x,y],...], optional "holes":[[[x,y],...]], "height", "twist", "scale_top", "round": any 2D outline pushed up: L-brackets, plates with cut-outs, logos, cams, I-beams, phone stands) | "revolve" ("profile":[[radius,z],...] lathe-turned around Z: vases, cups, bottles, bowls, knobs, lamp shades, chess pieces, wheels; outer wall bottom-to-top then inner wall back down for hollow forms) | "path" ("points":[[x,y,z],...],"radius", optional "radius_end" taper, "smooth":true, "closed": a smooth round wire/tube swept along a 3D path: mug handles, hooks, rails, pipes, wire frames, bent legs) | "spring" ("radius","wire","pitch","turns": coil spring / screw thread helix around Z).
+OPERATIONS: {"op":"union","children":[...]} fuses | {"op":"difference","children":[BASE, CUTTER, ...]} subtracts everything after the first (holes, slots, pockets, countersinks) | {"op":"intersection","children":[...]} | {"op":"hull","children":[...]} smooth convex skin over shapes (streamlined bodies, tapered housings) | {"op":"round","radius":2,"child":NODE} fillets all outer edges (add "mode":"both" or "inner" to fillet concave corners too); apply it to the finished body BEFORE small features | {"op":"chamfer","size":1,"child":NODE} | {"op":"shell","thickness":2.4,"open":"top","child":NODE} hollows any solid to a uniform wall, open on top/bottom/left/right/front/back or omitted for a closed hollow (boxes, bottles, cases, vases, cups from a plain solid) | {"op":"repeat","child":NODE,"count":6,"rotate":[0,0,60],"around":[0,0,0]} radial pattern, or with "translate":[dx,dy,dz] a linear pattern | {"op":"grid","counts":[4,3,1],"spacing":[16,16,0],"child":NODE} 2-D/3-D array (holes grids, pegboards, trays) | {"op":"mirror","child":NODE,"axis":"x","offset":0} symmetric copy kept alongside the original.
+DESIGN RULES: build ONE finished object, not loose parts: everything must overlap or touch so the union is a single piece. Make cutters taller/longer than the material they cut (extend 1-2 mm past each face) so no faces are coplanar. Lay a cylinder along X with rotation [0,90,0], along Y with [90,0,0]. Hollow things are shells or differences, never solid. Use real proportions (mug 80 mm tall and 75 mm wide with 3 mm walls; M5 screw hole radius 2.75; bracket plate 3-5 mm). Prefer "round" over sharp edges on consumer products. A wedge rotated [0,0,90] makes a corner gusset. Keep to 8-40 nodes. A node that fails is skipped and reported, so never leave parts to chance.
+EXAMPLE (mug): {"plan":"80mm tall, 76mm wide cup, 3mm wall, 4mm floor, D-handle fused to the side","tree":{"op":"union","children":[{"op":"difference","children":[{"shape":"cylinder","radius":38,"height":80},{"shape":"cylinder","radius":35,"height":80,"position":[0,0,4]}]},{"shape":"path","points":[[36,0,25],[52,0,28],[56,0,5],[50,0,-25],[36,0,-28]],"radius":4.5,"smooth":true}]}}
 EXAMPLE (L-bracket with holes): {"plan":"60x40x4 base plate plus 60x4x36 upright, 4 mounting holes r=3, 2 gussets","tree":{"op":"difference","children":[{"op":"union","children":[{"shape":"rounded_box","size":[60,40,4],"radius":1.5},{"shape":"rounded_box","size":[60,4,40],"radius":1.5,"position":[0,-18,18]},{"op":"mirror","axis":"x","child":{"shape":"wedge","size":[30,4,30],"rotation":[0,0,90],"position":[-20,-1,17]}}]},{"op":"repeat","count":2,"translate":[40,0,0],"child":{"shape":"cylinder","radius":3,"height":10,"position":[-20,8,0]}},{"op":"repeat","count":2,"translate":[40,0,0],"child":{"shape":"cylinder","radius":3,"height":10,"rotation":[90,0,0],"position":[-20,-18,28]}}]}}
 EXAMPLE (vase): {"plan":"90mm tall lathe-turned vase, 3mm wall","tree":{"shape":"revolve","profile":[[0,0],[22,0],[30,25],[18,60],[12,85],[15,90],[12,90],[9,85],[15,60],[27,25],[19,4],[0,4]]}}
-
+EXAMPLE (name keychain): {"plan":"50x22x3 rounded tag with raised 2mm lettering and a 4.4mm hanging hole","tree":{"op":"difference","children":[{"op":"union","children":[{"shape":"plate","size":[50,22,3],"corner_radius":6},{"shape":"text","text":"ALEX","size":10,"height":2,"position":[3,0,2.5]}]},{"shape":"cylinder","radius":2.2,"height":10,"position":[-19,0,0]}]}}
+EXAMPLE (storage box with soft edges): {"plan":"90x60x40 box, edges filleted 4mm, 2.4mm walls, open top, front thumb notch","tree":{"op":"difference","children":[{"op":"shell","thickness":2.4,"open":"top","child":{"op":"round","radius":4,"child":{"shape":"box","size":[90,60,40]}}},{"shape":"cylinder","radius":9,"height":10,"rotation":[90,0,0],"position":[0,-30,40]}]}}
 When the user asks for a specific file format, use that exact extension and matching kind. If the request only needs a text answer, return an empty files list. Use base64 only for true binary payloads that fit no kind above. Never use absolute paths, traversal, or more than 50 files.'''
 
 
@@ -496,6 +530,72 @@ def repair_files(model_id, power_config, prompt, problems):
         return []
 
 
+def blocking(fn, *args, **kwargs):
+    """Run a slow call in a thread while the response stream keeps emitting
+    {"type":"ping"} lines, so proxies never time out an idle connection.
+    Use as: result = yield from blocking(fn, ...)."""
+    box = {}
+
+    def run():
+        try: box["value"] = fn(*args, **kwargs)
+        except Exception as error: box["error"] = error
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        worker.join(8)
+        if worker.is_alive():
+            yield json.dumps({"type": "ping"}) + "\n"
+    if "error" in box: raise box["error"]
+    return box.get("value")
+
+
+def critique_model(model_id, prompt, raw_item, image_path):
+    """Ask a multimodal model whether the rendered CAD sheet satisfies the
+    request. Returns {"ok": bool, "issues": [...]} or None if unavailable."""
+    try:
+        encoded = base64.b64encode(Path(image_path).read_bytes()).decode()
+        plan = ""
+        try:
+            content = raw_item.get("content")
+            program = json.loads(content) if isinstance(content, str) else content
+            plan = str((program or {}).get("plan", ""))[:800]
+        except (ValueError, AttributeError):
+            pass
+        question = (
+            "You are a strict 3D-print design reviewer. The image is a rendered sheet of a CAD model: a large isometric view plus front, right and top views.\n"
+            f"The user asked for: \"{prompt[:1200]}\"\nThe designer's plan: \"{plan}\"\n\n"
+            "Judge ONLY whether the model clearly satisfies the request. Report concrete, significant, fixable defects such as: a requested part or feature that is missing; "
+            "parts that float or are detached; wrong proportions or scale between parts; features in the wrong place; a shape that does not resemble the requested object. "
+            "Ignore style, tiny details and rendering quality. If it is acceptable, say so.\n"
+            'Reply with ONLY JSON: {"ok": true or false, "issues": ["short, specific, fixable issue", ...]} (at most 4 issues; empty when ok).')
+        payload = {"model": model_id, "stream": False, "options": {"temperature": 0.1, "num_predict": 700},
+                   "messages": [{"role": "user", "content": question, "images": [encoded]}]}
+        response = requests.post(OLLAMA_CHAT_URL, headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"}, json=payload, timeout=120)
+        response.raise_for_status()
+        text = (response.json().get("message") or {}).get("content", "")
+        found = re.search(r"\{[\s\S]*\}", text)
+        verdict = json.loads(found.group(0)) if found else None
+        if not isinstance(verdict, dict) or "ok" not in verdict: return None
+        issues = [str(i).strip()[:240] for i in (verdict.get("issues") or []) if str(i).strip()][:4]
+        return {"ok": bool(verdict["ok"]) or not issues, "issues": issues}
+    except (requests.RequestException, ValueError, OSError, AttributeError, KeyError):
+        return None
+
+
+def swap_artifact(root, old_made, new_made):
+    """Replace a previously built artifact with a corrected one, keeping the original filename."""
+    old = root / old_made["path"]
+    old.unlink(missing_ok=True)
+    old.with_name(old.stem + "-preview.png").unlink(missing_ok=True)
+    new_file = root / new_made["path"]
+    if new_file != old:
+        new_file.rename(old)
+        new_preview = new_file.with_name(new_file.stem + "-preview.png")
+        if new_preview.exists(): new_preview.rename(old.with_name(old.stem + "-preview.png"))
+        new_made["path"] = old_made["path"]
+
+
 @app.get("/")
 def index(): return render_template("index.html")
 
@@ -564,7 +664,20 @@ def chat():
                "think": think_value(model_id, power_config),
                "options": {"temperature": 0.3, "num_predict": power_config["num_predict"]}}
 
+    requested_model = model_id
+    switch_note = None
     upstream, last_error = open_upstream(payload, UPSTREAM_TIMEOUT[power])
+    if upstream is None or upstream.status_code in (403, 404, 429, 500, 502, 503, 504):
+        alternative = fallback_model_id(model_id)
+        if alternative:  # chosen model unavailable (retired, paid-only, rate-limited): fall back to a proven free one
+            retry_payload = {**payload, "model": alternative, "think": think_value(alternative, power_config)}
+            retry, _ = open_upstream(retry_payload, UPSTREAM_TIMEOUT[power])
+            if retry is not None and retry.status_code < 400:
+                if upstream is not None: upstream.close()
+                upstream, payload, model_id = retry, retry_payload, alternative
+                switch_note = f"{requested_model} wasn't available right now, so Velaris used {alternative}."
+            elif retry is not None:
+                retry.close()
     if upstream is None:
         return jsonify(error=f"Ollama Cloud is temporarily unavailable ({last_error}). Please retry."), 502
     if upstream.status_code == 401:
@@ -584,8 +697,10 @@ def chat():
         extractor = ReplyStreamExtractor()
         raw_parts, done_reason = [], None
         try:
+            if switch_note:
+                yield json.dumps({"type": "info", "text": switch_note}) + "\n"
             if auto_upgraded_for_3d:
-                yield json.dumps({"type": "info", "text": f"3D model request detected — auto-using {model_id} at Max power for best build quality."}) + "\n"
+                yield json.dumps({"type": "info", "text": f"3D model request detected — using {model_id} at Max power for best build quality."}) + "\n"
             try:
                 for line in upstream.iter_lines(decode_unicode=True):
                     if not line: continue
@@ -635,57 +750,93 @@ def chat():
             if raw_files:
                 yield json.dumps({"type": "status", "text": f"Building {min(len(raw_files), 50)} file{'s' if len(raw_files) != 1 else ''}"}) + "\n"
             workspace_id = uuid.uuid4().hex; root = WORKSPACES / workspace_id; root.mkdir()
-            notes, created, problems = [], [], []
+            notes, created, problems, source_of = [], [], [], {}
             for raw_item in raw_files[:50]:
                 try:
-                    made = art.produce_artifact(root, raw_item, prompt)
-                    created.append(made)
+                    made = yield from blocking(art.produce_artifact, root, raw_item, prompt)
+                    created.append(made); source_of[made["path"]] = raw_item
                     flaws = [w for w in made["warnings"] if w.startswith("⚠️")]
                     if flaws and made["kind"] == "stl":
                         problems.append((raw_item, "; ".join(flaws), made))  # notes added only if this build is kept
                     else:
                         notes += made["warnings"]
                 except Exception as error:
-                    name = raw_item.get("path", "?") if isinstance(raw_item, dict) else "?"
                     if isinstance(raw_item, dict):
                         problems.append((raw_item, str(error), None))
                     else:
-                        notes.append(f"⚠️ Couldn't create '{name}': {error}")
+                        notes.append(f"⚠️ Couldn't create '?': {error}")
 
-            # One automatic self-correction round for anything that failed or built flawed.
-            if problems and not truncated:
-                yield json.dumps({"type": "status", "text": "Fixing problems found while verifying files"}) + "\n"
-                fixes = repair_files(model_id, power_config, prompt, [(p[0], p[1]) for p in problems])
-                fixed_paths = {}
+            # Self-correction: ask the chosen model to fix what failed or built flawed; if that
+            # doesn't resolve it, get a second opinion from a different model.
+            repair_models = [model_id] + [m for m in [fallback_model_id(model_id)] if m]
+            round_no = 0
+            while problems and not truncated and round_no < len(repair_models):
+                repair_model = repair_models[round_no]; round_no += 1
+                yield json.dumps({"type": "status", "text": "Fixing problems found while verifying files" if round_no == 1 else f"Trying again with {repair_model}"}) + "\n"
+                fixes = yield from blocking(repair_files, repair_model, power_config, prompt, [(p[0], p[1]) for p in problems])
+                remaining = list(problems)
                 for fix in fixes[:3]:
+                    replaced = next((p for p in remaining if str(p[0].get("path")) == str(fix.get("path"))), None)
+                    if replaced is None and len(remaining) == 1 and remaining[0][0].get("kind") == fix.get("kind"):
+                        replaced = remaining[0]
                     try:
-                        replaced = next((p for p in problems if str(p[0].get("path")) == str(fix.get("path"))), None)
-                        made = art.produce_artifact(root, fix, prompt)
-                        if replaced and replaced[2]:  # replace the flawed first build, keeping its filename
-                            old = root / replaced[2]["path"]
-                            old.unlink(missing_ok=True); old.with_name(old.stem + "-preview.png").unlink(missing_ok=True)
-                            created[:] = [c for c in created if c is not replaced[2]]
-                            new_file = root / made["path"]
-                            if new_file != old:
-                                new_file.rename(old)
-                                new_prev = new_file.with_name(new_file.stem + "-preview.png")
-                                if new_prev.exists(): new_prev.rename(old.with_name(old.stem + "-preview.png"))
-                                made["path"] = replaced[2]["path"]
-                        created.append(made)
-                        notes += made["warnings"]
-                        notes.append(f"ℹ️ '{fix.get('path')}' was automatically corrected after the first attempt had problems.")
-                        fixed_paths[str(fix.get("path"))] = True
+                        made = yield from blocking(art.produce_artifact, root, fix, prompt)
                     except Exception as error:
-                        notes.append(f"⚠️ The corrected '{fix.get('path')}' also failed: {error}")
-                for raw_item, error, made in problems:
-                    if str(raw_item.get("path")) in fixed_paths: continue
-                    if made:
-                        notes += made["warnings"]  # keep the first build, with its own notes and warning
+                        if replaced: remaining[remaining.index(replaced)] = (replaced[0], f"the corrected version also failed: {error}", replaced[2])
+                        continue
+                    if replaced and replaced[2]:
+                        swap_artifact(root, replaced[2], made)
+                        created[:] = [c for c in created if c is not replaced[2]]
+                    created.append(made); source_of[made["path"]] = fix
+                    flaws = [w for w in made["warnings"] if w.startswith("⚠️")]
+                    if replaced: remaining.remove(replaced)
+                    if flaws and made["kind"] == "stl" and round_no < len(repair_models):
+                        remaining.append((fix, "; ".join(flaws), made))  # still flawed: another model gets a turn
                     else:
-                        notes.append(f"⚠️ Couldn't create '{raw_item.get('path', '?')}': {error}")
-            else:
-                for raw_item, error, made in problems:
-                    notes += made["warnings"] if made else [f"⚠️ Couldn't create '{raw_item.get('path', '?')}': {error}"]
+                        notes += made["warnings"]
+                        if replaced is not None or not flaws: notes.append(f"ℹ️ '{fix.get('path')}' was automatically corrected after the first attempt had problems.")
+                problems = remaining
+            for raw_item, error, made in problems:
+                notes += made["warnings"] if made else [f"⚠️ Couldn't create '{raw_item.get('path', '?')}': {error}"]
+
+            # Visual review: a multimodal model looks at the rendered sheet and flags real defects.
+            vision_model = vision_model_id() if (VISION_CRITIC and not truncated and (auto_upgraded_for_3d or power in ("high", "max"))) else None
+            if vision_model:
+                for made in [c for c in created if c["kind"] == "stl"][:1]:
+                    built = root / made["path"]
+                    preview = built.with_name(built.stem + "-preview.png")
+                    raw_item = source_of.get(made["path"])
+                    if not preview.exists() or not raw_item: continue
+                    yield json.dumps({"type": "status", "text": "Reviewing the 3D model visually"}) + "\n"
+                    verdict = yield from blocking(critique_model, vision_model, prompt, raw_item, preview)
+                    if verdict is None: continue
+                    if verdict["ok"]:
+                        notes.append(f"ℹ️ Visual review ({vision_model}): looks right.")
+                        continue
+                    yield json.dumps({"type": "status", "text": "Improving the model from the review"}) + "\n"
+                    summary = "; ".join(verdict["issues"])
+                    fixes = yield from blocking(repair_files, model_id, power_config, prompt, [(raw_item, "A visual review of the rendered result found: " + summary)])
+                    improved = False
+                    previous_notes = list(made["warnings"])
+                    for fix in fixes[:1]:
+                        try:
+                            new_made = yield from blocking(art.produce_artifact, root, fix, prompt)
+                        except Exception:
+                            continue
+                        if any(w.startswith("⚠️") for w in new_made["warnings"]):
+                            (root / new_made["path"]).unlink(missing_ok=True)
+                            (root / new_made["path"]).with_name(Path(new_made["path"]).stem + "-preview.png").unlink(missing_ok=True)
+                            continue
+                        swap_artifact(root, made, new_made)
+                        created[:] = [c for c in created if c is not made] + [new_made]
+                        source_of[new_made["path"]] = fix
+                        made = new_made; improved = True
+                    if improved:
+                        notes[:] = [n for n in notes if n not in previous_notes]  # drop the replaced build's stats
+                        notes += made["warnings"]
+                        notes.append(f"ℹ️ Visual review ({vision_model}) found: {summary} — the model was revised to address this.")
+                    else:
+                        notes.append(f"ℹ️ Visual review ({vision_model}) suggested: {summary}")
 
             # Explicitly requested formats must materialise. If the model's own
             # file for a format failed or was missing, rebuild it from the reply.

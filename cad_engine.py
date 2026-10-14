@@ -62,6 +62,9 @@ def _vec(value, default=(0.0, 0.0, 0.0), name="vector", n=3):
         return tuple(float(v) for v in default)
     if isinstance(value, (int, float)):
         return tuple(float(value) for _ in range(n))
+    if isinstance(value, dict):
+        keys = (("x", "width", "w", "length"), ("y", "depth", "d"), ("z", "height", "h", "thickness"))
+        value = [next((value[k] for k in group if k in value), default[i]) for i, group in enumerate(keys)][:n]
     if not isinstance(value, (list, tuple)) or not value:
         raise CADError(f"{name} must be a list of {n} numbers")
     vals = [_num(v, name=name) for v in value][:n]
@@ -195,12 +198,13 @@ def _prism(spec):
     r = _num(spec.get("radius", 10), name="radius", minimum=0.01)
     h = _num(spec.get("height", 10), name="height", minimum=0.01)
     pts = _regular_polygon(spec.get("sides", 6), r)
-    return Manifold.extrude(CrossSection([pts]), h).translate([0, 0, -h / 2])
+    section = _round_section(CrossSection([pts]), _num(spec.get("round"), 0, "round", 0))
+    return Manifold.extrude(section, h).translate([0, 0, -h / 2])
 
 
 def _extrude(spec):
     h = _num(spec.get("height", 10), name="height", minimum=0.01)
-    section = _cross_section(spec)
+    section = _round_section(_cross_section(spec), _num(spec.get("round"), 0, "round", 0))
     twist = _num(spec.get("twist"), 0, "twist")
     scale_top = _num(spec.get("scale_top"), 1, "scale_top", 0)
     solid = Manifold.extrude(section, h, int(max(0, min(spec.get("divisions", 24 if twist else 0), 200))), twist, (scale_top, scale_top))
@@ -248,7 +252,118 @@ def _star(spec):
     return Manifold.extrude(CrossSection([pts]), h).translate([0, 0, -h / 2])
 
 
+def _round_section(section, radius, segments=24):
+    """Round the convex corners of a 2D outline (morphological opening)."""
+    r = max(0.0, float(radius))
+    if r <= 1e-6:
+        return section
+    rounded = section.offset(-r, m3d.JoinType.Round, 2.0, segments).offset(r, m3d.JoinType.Round, 2.0, segments)
+    return section if rounded.is_empty() else rounded
+
+
+def _plate(spec):
+    """Flat slab with rounded corners: tags, signs, bases, brackets, phone stands."""
+    w, d, h = _vec(spec.get("size"), (40, 20, 3), "size")
+    if min(w, d, h) <= 0:
+        raise CADError("plate size must be positive")
+    r = _num(spec.get("corner_radius", spec.get("radius")), min(w, d) * 0.12, "corner_radius", 0)
+    r = min(r, min(w, d) / 2 - 1e-3)
+    section = _round_section(CrossSection([[(-w / 2, -d / 2), (w / 2, -d / 2), (w / 2, d / 2), (-w / 2, d / 2)]]), r)
+    return Manifold.extrude(section, h).translate([0, 0, -h / 2])
+
+
+def _text(spec):
+    """Real 3D lettering from vector glyph outlines (DejaVu Sans), lying in XY and extruded up Z."""
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.textpath import TextPath
+    text = str(spec.get("text", ""))[:60]
+    if not text.strip():
+        raise CADError("text is empty")
+    size = _num(spec.get("size"), 10, "size", 1)
+    h = _num(spec.get("height"), 2, "height", 0.2)
+    weight = "bold" if spec.get("bold", True) else "normal"
+    path = TextPath((0, 0), text, size=size, prop=FontProperties(family="DejaVu Sans", weight=weight))
+    polys = [[(float(x), float(y)) for x, y in poly] for poly in path.to_polygons(closed_only=True) if len(poly) >= 3]
+    if not polys:
+        raise CADError("the text has no printable outlines")
+    section = CrossSection(polys, m3d.FillRule.EvenOdd)
+    if section.is_empty():
+        raise CADError("the text has no printable outlines")
+    x0, y0, x1, y1 = section.bounds()
+    align = str(spec.get("align", "center")).lower()
+    dx = -(x0 + x1) / 2 if align == "center" else (-x0 if align == "left" else -x1)
+    section = section.translate([dx, -(y0 + y1) / 2])
+    return Manifold.extrude(section, h).translate([0, 0, -h / 2])
+
+
+def _catmull_rom(points, closed, sub=8):
+    n = len(points)
+    out = []
+    count = n if closed else n - 1
+    for i in range(count):
+        p0, p1, p2, p3 = (points[(i - 1) % n], points[i], points[(i + 1) % n], points[(i + 2) % n]) if closed else (
+            points[max(i - 1, 0)], points[i], points[i + 1], points[min(i + 2, n - 1)])
+        for k in range(sub):
+            t = k / sub
+            t2, t3 = t * t, t * t * t
+            out.append(tuple(0.5 * ((2 * p1[j]) + (-p0[j] + p2[j]) * t + (2 * p0[j] - 5 * p1[j] + 4 * p2[j] - p3[j]) * t2 + (-p0[j] + 3 * p1[j] - 3 * p2[j] + p3[j]) * t3) for j in range(3)))
+    if not closed:
+        out.append(tuple(points[-1]))
+    return out
+
+
+def _sweep_points(points, radius, radius_end, closed, seg):
+    """Solid wire of constant (or tapering) radius along a 3D polyline: hulls of
+    consecutive spheres, fused. Used for handles, rails, hooks, springs, pipes."""
+    if len(points) < 2:
+        raise CADError("a path needs at least 2 points")
+    if len(points) > 260:
+        step = len(points) / 260.0
+        points = [points[int(i * step)] for i in range(260)] + [points[-1]]
+    r_end = radius if radius_end is None else radius_end
+    last = len(points) - 1
+    balls = []
+    for i, p in enumerate(points):
+        r = radius + (r_end - radius) * (i / max(last, 1))
+        balls.append(Manifold.sphere(max(r, 0.05), seg).translate(list(p)))
+    pairs = [Manifold.batch_hull([balls[i], balls[i + 1]]) for i in range(last)]
+    if closed:
+        pairs.append(Manifold.batch_hull([balls[last], balls[0]]))
+    return _union(pairs)
+
+
+def _path(spec):
+    pts = spec.get("points")
+    if not isinstance(pts, list) or len(pts) < 2:
+        raise CADError("path needs 'points': [[x,y,z], ...]")
+    points = [_vec(p, name="path point") for p in pts][:120]
+    closed = bool(spec.get("closed", False))
+    if spec.get("smooth", True) and len(points) >= 3:
+        points = _catmull_rom(points, closed, int(max(2, min(_num(spec.get("detail"), 8, "detail"), 16))))
+    r = _num(spec.get("radius", 2), name="radius", minimum=0.05)
+    r_end = None if spec.get("radius_end") is None else _num(spec.get("radius_end"), name="radius_end", minimum=0.05)
+    solid = _sweep_points(points, r, r_end, closed, 12 if r < 3 else 16)
+    box = solid.bounding_box()
+    return solid.translate([-(box[0] + box[3]) / 2, -(box[1] + box[4]) / 2, -(box[2] + box[5]) / 2]) if spec.get("center", False) else solid
+
+
+def _spring(spec):
+    """Coil spring / screw thread helix around the Z axis."""
+    R = _num(spec.get("radius", 10), name="radius", minimum=0.2)
+    wire = _num(spec.get("wire", spec.get("wire_radius", 1.2)), name="wire", minimum=0.1)
+    pitch = _num(spec.get("pitch", 4), name="pitch", minimum=wire * 2.05)
+    turns = _num(spec.get("turns", 6), name="turns", minimum=0.5)
+    if turns > 40:
+        raise CADError("spring has too many turns (max 40)")
+    steps = int(max(12, min(turns * 14, 240)))
+    points = [(R * math.cos(2 * math.pi * turns * i / steps), R * math.sin(2 * math.pi * turns * i / steps), pitch * turns * i / steps) for i in range(steps + 1)]
+    solid = _sweep_points(points, wire, None, False, 12)
+    box = solid.bounding_box()
+    return solid.translate([0, 0, -(box[2] + box[5]) / 2])
+
+
 SHAPES = {
+    "plate": _plate, "text": _text, "path": _path, "wire": _path, "spring": _spring, "coil": _spring,
     "gear": _gear, "star": _star,
     "box": _box, "cube": _box, "rounded_box": _rounded_box, "sphere": _sphere, "cylinder": _cylinder,
     "cone": _cone, "tube": _tube, "pipe": _tube, "torus": _torus, "capsule": _capsule, "wedge": _wedge,
@@ -312,14 +427,73 @@ def _eval_children(spec, ctx, depth, key="children"):
     return out
 
 
+_SHAPE_ALIASES = {"cube": "box", "rect": "box", "cuboid": "box", "block": "box", "ball": "sphere", "round_box": "rounded_box",
+                  "roundedbox": "rounded_box", "disk": "cylinder", "disc": "cylinder", "rod": "cylinder", "pipe": "tube", "ring": "tube",
+                  "donut": "torus", "label": "text", "lettering": "text", "slab": "plate", "helix": "spring", "polygon": "prism"}
+_OP_ALIASES = {"merge": "union", "combine": "union", "join": "union", "fuse": "union", "minus": "difference", "subtraction": "difference",
+               "remove": "difference", "carve": "difference", "intersect": "intersection", "bevel": "chamfer", "fillets": "round",
+               "hollow": "shell", "array": "grid", "pattern": "repeat", "symmetry": "mirror"}
+
+
+def _normalize(spec):
+    """Accept the common ways models misspell the CAD schema: type/kind -> shape,
+    diameter -> radius, width/depth/height -> size, dims -> size, pos -> position..."""
+    spec = dict(spec)
+    if "shape" not in spec and isinstance(spec.get("type"), str):
+        spec["shape"] = spec.pop("type")
+    if "op" not in spec and isinstance(spec.get("operation"), str):
+        spec["op"] = spec.pop("operation")
+    if isinstance(spec.get("shape"), str):
+        spec["shape"] = _SHAPE_ALIASES.get(spec["shape"].lower().strip(), spec["shape"].lower().strip())
+    if isinstance(spec.get("op"), str):
+        spec["op"] = _OP_ALIASES.get(spec["op"].lower().strip(), spec["op"].lower().strip())
+    for src in ("dimensions", "dims", "extents"):
+        if src in spec and "size" not in spec:
+            spec["size"] = spec.pop(src)
+    for src in ("pos", "location", "at", "offset_position", "center"):
+        if src in spec and "position" not in spec and isinstance(spec[src], (list, tuple)):
+            spec["position"] = spec.pop(src)
+    for src in ("rot", "angle", "orientation"):
+        if src in spec and "rotation" not in spec and isinstance(spec[src], (list, tuple)):
+            spec["rotation"] = spec.pop(src)
+    if spec.get("shape") and "translate" in spec and "position" not in spec and isinstance(spec["translate"], (list, tuple)):
+        spec["position"] = spec.pop("translate")
+    if "radius" not in spec:
+        for src, factor in (("diameter", 0.5), ("d", 0.5), ("r", 1.0)):
+            if src in spec and isinstance(spec[src], (int, float, str)):
+                try: spec["radius"] = float(spec[src]) * factor; break
+                except ValueError: pass
+    if "inner_radius" not in spec and "inner_diameter" in spec:
+        try: spec["inner_radius"] = float(spec["inner_diameter"]) / 2
+        except (TypeError, ValueError): pass
+    if "size" not in spec and spec.get("shape") in ("box", "rounded_box", "plate", "wedge"):
+        w = spec.get("width", spec.get("length", spec.get("w", spec.get("x"))))
+        d = spec.get("depth", spec.get("d", spec.get("y")))
+        h = spec.get("height", spec.get("thickness", spec.get("h", spec.get("z"))))
+        if w is not None or d is not None or h is not None:
+            spec["size"] = [w if w is not None else 20, d if d is not None else 20, h if h is not None else 20]
+    if "height" not in spec and "h" in spec and spec.get("shape") in ("cylinder", "cone", "tube", "prism", "extrude", "gear", "star", "text", "capsule"):
+        spec["height"] = spec["h"]
+    if "children" not in spec:
+        for src in ("items", "components", "nodes", "shapes", "parts", "operands", "elements"):
+            if isinstance(spec.get(src), list):
+                spec["children"] = spec.pop(src); break
+    if "child" not in spec and isinstance(spec.get("target"), dict):
+        spec["child"] = spec.pop("target")
+    return spec
+
+
 def _eval(spec, ctx, depth=0):
     if depth > MAX_DEPTH:
         raise CADError("model nesting is too deep")
     ctx.nodes += 1
     if ctx.nodes > MAX_NODES:
         raise CADError("model has too many parts")
+    if isinstance(spec, list):
+        spec = {"op": "union", "children": spec}
     if not isinstance(spec, dict):
         raise CADError("each part must be an object")
+    spec = _normalize(spec)
 
     op = str(spec.get("op", "")).lower()
     shape = str(spec.get("shape", "")).lower()
@@ -363,6 +537,33 @@ def _eval(spec, ctx, depth=0):
             raise CADError("intersection is empty — the shapes don't overlap")
         return _transform(solid, spec)
 
+    if op in ("round", "fillet", "soften"):
+        child = _eval(spec.get("child") or (spec.get("children") or [None])[0], ctx, depth + 1)
+        solid = _rounded(child, _num(spec.get("radius"), 1.5, "radius", 0.05), str(spec.get("mode", "outer")).lower(), ctx)
+        return _transform(solid, spec)
+
+    if op == "chamfer":
+        child = _eval(spec.get("child") or (spec.get("children") or [None])[0], ctx, depth + 1)
+        solid = _rounded(child, _num(spec.get("size", spec.get("radius")), 1.0, "size", 0.05), "outer", ctx, chamfer=True)
+        return _transform(solid, spec)
+
+    if op == "shell":
+        child = _eval(spec.get("child") or (spec.get("children") or [None])[0], ctx, depth + 1)
+        return _transform(_shell(child, _num(spec.get("thickness"), 2.0, "thickness", 0.2), spec.get("open")), spec)
+
+    if op == "grid":
+        child = _eval(spec.get("child") or (spec.get("children") or [None])[0], ctx, depth + 1)
+        nx, ny, nz = [int(max(1, min(_num(v, 1, "counts"), MAX_REPEAT))) for v in _vec(spec.get("counts"), (2, 2, 1), "counts")]
+        if nx * ny * nz > 500:
+            raise CADError("grid has too many copies (max 500)")
+        dx, dy, dz = _vec(spec.get("spacing"), (10, 10, 10), "spacing")
+        copies = [child.translate([i * dx, j * dy, k * dz]) for i in range(nx) for j in range(ny) for k in range(nz)]
+        solid = _union(copies)
+        if spec.get("center", True):
+            b = solid.bounding_box()
+            solid = solid.translate([-(nx - 1) * dx / 2, -(ny - 1) * dy / 2, -(nz - 1) * dz / 2])
+        return _transform(solid, spec)
+
     if op == "hull":
         kids = _eval_children(spec, ctx, depth)
         solid = Manifold.batch_hull(kids) if hasattr(Manifold, "batch_hull") else _union(kids).hull()
@@ -395,6 +596,84 @@ def _eval(spec, ctx, depth=0):
         return _transform(solid, spec)
 
     raise CADError(f"unknown node (needs 'shape' or 'op'): {sorted(spec)[:6]}")
+
+
+
+def _ball(radius, seg):
+    """Convex ball with vertices exactly on the ±X/±Y/±Z axes, so offsetting by it
+    keeps flat faces at their exact distances (dimensions never shrink or grow)."""
+    lon = max(8, (int(seg) + 3) // 4 * 4)
+    lat = max(4, (lon // 2 + 1) // 2 * 2)
+    points = [[0.0, 0.0, radius], [0.0, 0.0, -radius]]
+    for i in range(1, lat):
+        phi = math.pi * i / lat
+        for j in range(lon):
+            theta = 2 * math.pi * j / lon
+            points.append([radius * math.sin(phi) * math.cos(theta), radius * math.sin(phi) * math.sin(theta), radius * math.cos(phi)])
+    return Manifold.hull_points(points)
+
+
+def _rounded(solid, radius, mode, ctx, chamfer=False):
+    """Fillet outer edges (opening) and/or inner edges (closing) with a ball
+    (or an octahedron for chamfers), halving the radius until the shape keeps
+    its volume — so thin parts are never eaten."""
+    tris = solid.num_tri()
+    if tris > 24000:
+        ctx.warn("⚠️ A part was too detailed to round — left sharp.")
+        return solid
+    seg = 14 if tris < 3000 else 10 if tris < 9000 else 8
+    original = solid.volume()
+    r = radius
+    for _ in range(4):
+        ball = (Manifold.hull_points([[r, 0, 0], [-r, 0, 0], [0, r, 0], [0, -r, 0], [0, 0, r], [0, 0, -r]]) if chamfer
+                else _ball(r, seg))
+        out = solid
+        if mode in ("outer", "both", "convex"):
+            eroded = out.minkowski_difference(ball)
+            if eroded.is_empty() or eroded.volume() < 0.35 * original:
+                r /= 2; continue
+            out = eroded.minkowski_sum(ball)
+        if mode in ("inner", "both", "concave"):
+            out = out.minkowski_sum(ball).minkowski_difference(ball)
+        if not out.is_empty() and out.status() == m3d.Error.NoError and abs(out.volume() - original) < 0.2 * original:
+            if r < radius:
+                ctx.warn(f"ℹ️ Rounding radius reduced to {r:.2f} mm so thin parts survive.")
+            return out
+        r /= 2
+    ctx.warn("ℹ️ A part is too thin to round — left sharp.")
+    return solid
+
+
+def _shell(solid, thickness, opening):
+    """Hollow a solid to a uniform wall thickness, optionally open on one side."""
+    if solid.num_tri() > 24000:
+        raise CADError("shape is too detailed to shell")
+    ball = _ball(thickness, 12)
+    inner = solid.minkowski_difference(ball)
+    if inner.is_empty():
+        raise CADError(f"shell thickness {thickness:g} mm is too large for this shape")
+    result = solid - inner
+    side = str(opening or "").lower()
+    if side in ("top", "bottom", "left", "right", "front", "back", "+z", "-z", "+x", "-x", "+y", "-y"):
+        ib = inner.bounding_box()
+        big = 5000.0
+        e = 0.01
+        if side in ("top", "+z"):
+            cutter = Manifold.cube([ib[3] - ib[0] + 2 * e, ib[4] - ib[1] + 2 * e, big]).translate([ib[0] - e, ib[1] - e, ib[5] - e])
+        elif side in ("bottom", "-z"):
+            cutter = Manifold.cube([ib[3] - ib[0] + 2 * e, ib[4] - ib[1] + 2 * e, big]).translate([ib[0] - e, ib[1] - e, ib[2] + e - big])
+        elif side in ("right", "+x"):
+            cutter = Manifold.cube([big, ib[4] - ib[1] + 2 * e, ib[5] - ib[2] + 2 * e]).translate([ib[3] - e, ib[1] - e, ib[2] - e])
+        elif side in ("left", "-x"):
+            cutter = Manifold.cube([big, ib[4] - ib[1] + 2 * e, ib[5] - ib[2] + 2 * e]).translate([ib[0] + e - big, ib[1] - e, ib[2] - e])
+        elif side in ("back", "+y"):
+            cutter = Manifold.cube([ib[3] - ib[0] + 2 * e, big, ib[5] - ib[2] + 2 * e]).translate([ib[0] - e, ib[4] - e, ib[2] - e])
+        else:
+            cutter = Manifold.cube([ib[3] - ib[0] + 2 * e, big, ib[5] - ib[2] + 2 * e]).translate([ib[0] - e, ib[1] + e - big, ib[2] - e])
+        result = result - cutter
+    if result.is_empty():
+        raise CADError("shell produced nothing")
+    return result
 
 
 def _apply_bore(solid, bore):
@@ -460,7 +739,7 @@ def build_program(spec):
         raise CADError("3D program needs a 'tree', 'parts' or 'ops'")
 
     solid = _eval(tree, ctx)
-    if solid.is_empty():
+    if solid is None or solid.is_empty():
         raise CADError("the model has no geometry")
 
     box = solid.bounding_box()
@@ -496,6 +775,11 @@ def build_program(spec):
         f"{info['volume_mm3'] / 1000:.2f} cm³, {info['triangles']:,} triangles, watertight (verified)"
         + (f", {info['genus']} through-hole{'s' if info['genus'] != 1 else ''}" if info["pieces"] == 1 and info["genus"] > 0 else "")
         + (f", {info['pieces']} separate pieces" if info["pieces"] > 1 else "") + ".")
+    thickness = 2 * info["volume_mm3"] / max(info["surface_mm2"], 1e-9)
+    if thickness < 0.8:
+        notes.append(f"ℹ️ Average wall thickness is only about {thickness:.2f} mm — it may be fragile to print; consider thickening thin parts.")
+    if max(info["size"]) > 256:
+        notes.append("ℹ️ At least one dimension is over 256 mm, larger than many hobby 3D-printer beds — scale it down or split it for printing.")
     if info["pieces"] > 1:
         notes.append("⚠️ The model is made of separate, unconnected pieces — if it should be one object, make the parts overlap so they fuse.")
     return solid, notes, info
@@ -584,14 +868,13 @@ def _corner_normals(verts, tris, face_n, threshold_deg=38.0):
     return out
 
 
-def render_preview(solid, path, width=1000, height=760):
-    """Z-buffered, smooth-shaded isometric render with a ground shadow."""
+def _render_view(verts, tris, yaw_deg, pitch_deg, width, height, ss=2, ground=True, fit=0.74):
+    """Z-buffered, smooth-shaded render of one view; returns a PIL image."""
     from PIL import Image
 
-    verts, tris = mesh_arrays(solid)
     centre = (verts.max(axis=0) + verts.min(axis=0)) / 2
     v = verts - centre
-    yaw, pitch = math.radians(-35), math.radians(26)
+    yaw, pitch = math.radians(yaw_deg), math.radians(pitch_deg)
     rz = np.array([[math.cos(yaw), -math.sin(yaw), 0], [math.sin(yaw), math.cos(yaw), 0], [0, 0, 1]])
     rx = np.array([[1, 0, 0], [0, math.cos(pitch), -math.sin(pitch)], [0, math.sin(pitch), math.cos(pitch)]])
     rot = rx @ rz
@@ -605,10 +888,9 @@ def render_preview(solid, path, width=1000, height=760):
     fill = np.array([0.6, -0.3, 0.2]); fill /= np.linalg.norm(fill)
     corner_shade = (np.clip(corner_n @ key, 0, 1) * 0.68 + np.clip(corner_n @ fill, 0, 1) * 0.18 + 0.22)
 
-    ss = 2
     W, H = width * ss, height * ss
     extent = max(np.ptp(p[:, 0]), np.ptp(p[:, 2]), 1e-6)
-    scale = 0.74 * min(W, H) / extent
+    scale = fit * min(W, H) / extent
     sx = W / 2 + p[:, 0] * scale
     sy = H / 2 - p[:, 2] * scale + 0.03 * H
     zbuf = np.full((H, W), np.inf)
@@ -647,12 +929,48 @@ def render_preview(solid, path, width=1000, height=760):
     yy, xx = np.mgrid[0:H, 0:W]
     rx_, ry_ = max(np.ptp(p[:, 0]) * scale * 0.55, 10), max(np.ptp(p[:, 0]) * scale * 0.14, 6)
     shadow = np.clip(1 - (((xx - W / 2) / rx_) ** 2 + ((yy - (foot_y + 0.01 * H)) / ry_) ** 2), 0, 1)
-    bg = bg * (1 - 0.45 * shadow[:, :, None])
+    bg = bg * (1 - 0.45 * shadow[:, :, None]) if ground else bg
     base = np.array([112, 168, 255], dtype=np.float64)
     lit = np.clip(base[None, None, :] * shade_buf[:, :, None] + 14, 0, 255)
     frame = np.where(cover[:, :, None], lit, bg).astype(np.uint8)
-    Image.fromarray(frame).resize((width, height), Image.LANCZOS).save(path, "PNG")
+    return Image.fromarray(frame).resize((width, height), Image.LANCZOS)
 
+
+
+
+def _label_font(size):
+    try:
+        from matplotlib.font_manager import findfont
+        from PIL import ImageFont
+        return ImageFont.truetype(findfont("DejaVu Sans"), size)
+    except Exception:
+        from PIL import ImageFont
+        return ImageFont.load_default()
+
+
+def render_preview(solid, path, width=1440, height=820):
+    """CAD-style sheet: a large isometric view plus front / right / top views."""
+    from PIL import Image, ImageDraw
+
+    verts, tris = mesh_arrays(solid)
+    box = solid.bounding_box()
+    dims = f"{box[3] - box[0]:.1f} × {box[4] - box[1]:.1f} × {box[5] - box[2]:.1f} mm"
+    heavy = len(tris) > 30000
+    iso_w = int(width * 0.66) if not heavy else width
+    iso = _render_view(verts, tris, -35, 26, iso_w, height, ss=1 if heavy else 2)
+    sheet = Image.new("RGB", (width, height), (20, 22, 30))
+    sheet.paste(iso, (0, 0))
+    draw = ImageDraw.Draw(sheet)
+    draw.text((22, height - 40), dims, fill=(170, 180, 205), font=_label_font(20))
+    if not heavy:
+        col_w, gap = width - iso_w, 8
+        view_h = (height - 2 * gap) // 3
+        for i, (label, yaw, pitch) in enumerate((("FRONT", 0, 0), ("RIGHT", -90, 0), ("TOP", 0, 90))):
+            view = _render_view(verts, tris, yaw, pitch, col_w - gap, view_h, ss=2, ground=False, fit=0.62)
+            y = i * (view_h + gap)
+            sheet.paste(view, (iso_w + gap, y))
+            draw.text((iso_w + gap + 12, y + 8), label, fill=(150, 160, 185), font=_label_font(15))
+    sheet.save(path, "PNG")
 
 def build_files(stl_path, spec, preview_path=None):
     """Build, write, independently verify, preview. Returns (notes, info)."""

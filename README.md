@@ -50,24 +50,27 @@ Chats are stored in this browser's `localStorage` only (clear them from the prof
 
 ## 3D modelling (CAD engine)
 
-`cad_engine.py` runs a real solid-modelling kernel ([Manifold](https://github.com/elalish/manifold), via `manifold3d`) instead of stacking loose primitives. The model writes a JSON CSG tree; Velaris evaluates it exactly:
+`cad_engine.py` runs a real solid-modelling kernel ([Manifold](https://github.com/elalish/manifold), via `manifold3d`). The model writes a JSON CSG tree and Velaris evaluates it exactly:
 
-- **Shapes:** box, rounded_box, sphere, cylinder/cone (tapers), tube, torus, capsule, wedge, pyramid, prism (hex nuts…), gear, star, `extrude` (any 2D outline with holes, twist, taper) and `revolve` (lathe profile → vases, cups, bottles, knobs, chess pieces).
-- **Operations:** union, difference (holes, slots, hollowing), intersection, hull, radial/linear `repeat`, `mirror`.
-- **Output:** a *binary* STL that is watertight by construction, **independently re-checked** (closed surface, outward faces, positive volume), centred and set on the build plate (min Z = 0), plus a smooth-shaded `*-preview.png`. Absurd sizes are rescaled; disconnected pieces and skipped parts are reported.
-- **Self-repair:** if a 3D program fails or builds with problems, Velaris shows the model the exact error and asks for a corrected version (one automatic round) before telling you anything went wrong. The same loop covers every other file type.
-- If `manifold3d` can't be installed, it falls back to the older primitive-assembly STL engine.
-
-Quality still depends on the model you pick: GPT-OSS 120B at High/Max power (what 3D requests auto-select) is the best default; larger cloud models do better on complex organic shapes.
+- **Shapes:** box, rounded_box, plate (rounded-corner slab), sphere, cylinder/cone, tube, torus, capsule, wedge, pyramid, prism, gear, star, **text** (real 3D lettering), `extrude` (any 2D outline with holes, twist, taper, rounded corners), `revolve` (lathe profiles), **path** (smooth swept wire for handles, hooks, rails) and **spring**.
+- **Operations:** union, difference, intersection, hull, **round** (exact fillets), **chamfer**, **shell** (uniform walls, open on any side), radial/linear `repeat`, `grid`, `mirror`.
+- **Tolerant input:** common schema slips (`type`, `diameter`, `dimensions`, `pos`, `components`, string numbers, a list as the tree…) are understood rather than rejected.
+- **Verified output:** a binary STL that is watertight by construction and independently re-checked (closed surface, outward faces, positive volume), centred and set on the build plate, with printability notes (wall thickness, bed size, disconnected pieces).
+- **Preview sheet:** a smooth-shaded isometric view plus front / right / top views with overall dimensions, shown in chat, and an interactive WebGL viewer in the files panel.
+- **Self-correction:** a failed or flawed build goes back to the model with the exact error; if that doesn't fix it, a *different* model gets a turn. Then a multimodal model (Gemma 4, free) looks at the rendered sheet and, if it spots a real defect (missing part, floating part, wrong proportions), the model revises the program once. All steps stream as progress in the UI.
+- If `manifold3d` can't be installed, the older primitive-assembly STL engine is used.
 
 ## Models
 
-Ollama retires and replaces cloud models regularly, so Velaris no longer hardcodes a catalogue. On start-up (and every 10 minutes) it asks Ollama Cloud which models exist (`/api/tags`) and offers:
+Ollama Cloud models change often, so Velaris asks Ollama which models exist (`/api/tags`, cached 10 minutes) and shows only those it can use:
 
-- **GPT-OSS 120B** (default) and **GPT-OSS 20B** — the stable baseline; 120B is also what 3D-modeling requests auto-switch to at Max power.
-- Any newer families found live (Kimi K2, GLM-5, MiniMax M, Qwen Coder, DeepSeek) — shown automatically when Ollama serves them, never when it doesn't.
+- **GPT-OSS 120B** (default) and **20B** — the proven baseline.
+- **Free-tier extras when listed:** NVIDIA Nemotron 3 Ultra (most capable free model; used automatically for 3D builds), Nemotron 3 Super, and Gemma 4 31B (multimodal; used for the visual review of 3D models).
+- Paid-plan families (Kimi, GLM, MiniMax, Qwen Coder, DeepSeek) are hidden unless you set `VELARIS_SHOW_PAID_MODELS=1`.
 
-If the lookup fails, the GPT-OSS baseline is used. Override with env vars `VELARIS_DEFAULT_MODEL` and `VELARIS_BEST_MODEL` (must be models the server lists). The server only accepts model ids from its own catalogue, and retries without `think` if a model family rejects that parameter (only GPT-OSS takes low/medium/high effort levels; other families get on/off).
+If a chosen model is retired, paid-only or rate-limited, the request is retried automatically on a proven free model. Only models from Ollama's cloud API are ever used (never a local daemon), and the server accepts only ids from its own catalogue.
+
+Environment variables: `VELARIS_DEFAULT_MODEL`, `VELARIS_BEST_MODEL` (3D builds), `VELARIS_VISION_MODEL`, `VELARIS_VISION_CRITIC=0` (turn the visual review off), `VELARIS_SHOW_PAID_MODELS=1`, `VELARIS_RATE_LIMIT_PER_MIN`.
 
 ## File production
 

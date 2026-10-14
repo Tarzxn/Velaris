@@ -195,9 +195,9 @@ details.fold[open] > summary svg.ic { transform: rotate(90deg); }
 
 /* file cards (inline in the thread) */
 .files { margin: 6px 0 4px; display: grid; gap: 8px; }
-.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin-bottom: 8px; }
-.gallery button { border: 1px solid var(--border); border-radius: 14px; overflow: hidden; background: var(--surface); aspect-ratio: 4 / 3; }
-.gallery img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .25s var(--ease); }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px; margin-bottom: 8px; }
+.gallery button { border: 1px solid var(--border); border-radius: 14px; overflow: hidden; background: #14161d; }
+.gallery img { width: 100%; height: auto; max-height: 360px; object-fit: contain; display: block; transition: transform .25s var(--ease); }
 .gallery button:hover img { transform: scale(1.03); }
 .file-card { display: flex; align-items: center; gap: 12px; width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); text-align: left; transition: background .15s, border-color .15s; }
 .file-card:hover { background: var(--surface-2); border-color: var(--border-strong); }
