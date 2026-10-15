@@ -2,6 +2,7 @@ services:
   - type: web
     name: velaris-ollama-cloud
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     healthCheckPath: /healthz
     startCommand: gunicorn app:app --workers 1 --worker-class gthread --threads 8 --timeout 420
@@ -12,3 +13,13 @@ services:
         sync: false
       - key: TAVILY_API_KEY
         sync: false
+      - key: CLOUDFLARE_ACCOUNT_ID
+        sync: false
+      - key: CLOUDFLARE_API_TOKEN
+        sync: false
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: MALLOC_ARENA_MAX
+        value: "2"

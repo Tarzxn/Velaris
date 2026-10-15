@@ -1,0 +1,10 @@
+{
+  "plan": "180mm procedural standing human figurine; review likeness, small features and print supports",
+  "tree": {
+    "shape": "human",
+    "height": 180,
+    "build": 1,
+    "arm_angle": 12,
+    "resolution": 144
+  }
+}

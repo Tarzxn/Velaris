@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - exercised only when the wheel is missing
 
 MAX_NODES = 600
 MAX_REPEAT = 200
-MAX_TRIANGLES = 400_000
+MAX_TRIANGLES = 200_000
 MAX_DEPTH = 24
 
 
@@ -422,8 +422,8 @@ def _eval_children(spec, ctx, depth, key="children"):
     for index, child in enumerate(children):
         try:
             out.append(_eval(child, ctx, depth + 1))
-        except CADError as error:
-            ctx.warn(f"⚠️ {spec.get('op', 'group')} child {index + 1} skipped: {error}")
+        except (ValueError, TypeError) as error:
+            raise CADError(f"{spec.get('op', 'group')} child {index + 1} failed: {error}") from error
     return out
 
 
@@ -474,7 +474,7 @@ def _normalize(spec):
             spec["size"] = [w if w is not None else 20, d if d is not None else 20, h if h is not None else 20]
     if "height" not in spec and "h" in spec and spec.get("shape") in ("cylinder", "cone", "tube", "prism", "extrude", "gear", "star", "text", "capsule"):
         spec["height"] = spec["h"]
-    if "children" not in spec:
+    if "children" not in spec and spec.get('shape') != 'sculpt':
         for src in ("items", "components", "nodes", "shapes", "parts", "operands", "elements"):
             if isinstance(spec.get(src), list):
                 spec["children"] = spec.pop(src); break
@@ -499,6 +499,17 @@ def _eval(spec, ctx, depth=0):
     shape = str(spec.get("shape", "")).lower()
 
     if shape and op in ("", "add"):
+        if shape in ("mesh", "loft", "sculpt", "human"):
+            import mesh_engine
+            try:
+                mesh = mesh_engine.build_shape(spec)
+                mesh.validate(connected=not spec.get("allow_multiple", False))
+                solid = Manifold(m3d.Mesh(np.asarray(mesh.vertices, dtype=np.float32), np.asarray(mesh.faces, dtype=np.uint32)))
+                if solid.status() != m3d.Error.NoError or solid.is_empty():
+                    raise CADError(f"Mesh could not become a solid: {solid.status()}")
+            except (ValueError, TypeError) as error:
+                raise CADError(str(error)) from error
+            return _transform(solid, spec)
         builder = SHAPES.get(shape)
         if builder is None:
             raise CADError(f"unknown shape '{shape}' (use: {', '.join(sorted(set(SHAPES) - {'cube', 'pipe', 'lathe'}))})")
@@ -695,10 +706,11 @@ def _apply_bore(solid, bore):
 def _legacy_ops_to_tree(ops, ctx):
     """Old add/repeat/mirror programs -> a tree, fused by a real union."""
     nodes = []
-    for index, op in enumerate(ops[:200]):
+    if not isinstance(ops,list) or not 1 <= len(ops) <= 200:
+        raise CADError('Legacy program must contain 1–200 steps; split a larger model')
+    for index, op in enumerate(ops):
         if not isinstance(op, dict):
-            ctx.warn(f"⚠️ Step {index + 1}: not an object — skipped.")
-            continue
+            raise CADError(f'Step {index+1}: each step must be an object')
         kind = str(op.get("op", "add")).lower()
         if kind == "add":
             node = {k: v for k, v in op.items() if k != "op"}
@@ -709,7 +721,7 @@ def _legacy_ops_to_tree(ops, ctx):
             wrapper["child"] = previous
             nodes.append(wrapper)
         else:
-            ctx.warn(f"⚠️ Step {index + 1}: '{kind}' has nothing to act on — skipped.")
+            raise CADError(f"Step {index+1}: unsupported operation '{kind}' or nothing to act on")
     return {"op": "union", "children": nodes}
 
 
@@ -727,6 +739,8 @@ def build_program(spec):
         raise CADError("3D program must be a JSON object")
     if spec.get("tree") is not None:
         tree = spec["tree"]
+    elif spec.get("shape") or spec.get("op"):
+        tree = spec
     elif spec.get("parts"):
         tree = {"op": "union", "children": spec["parts"]}
     elif spec.get("ops"):
@@ -775,9 +789,7 @@ def build_program(spec):
         f"{info['volume_mm3'] / 1000:.2f} cm³, {info['triangles']:,} triangles, watertight (verified)"
         + (f", {info['genus']} through-hole{'s' if info['genus'] != 1 else ''}" if info["pieces"] == 1 and info["genus"] > 0 else "")
         + (f", {info['pieces']} separate pieces" if info["pieces"] > 1 else "") + ".")
-    thickness = 2 * info["volume_mm3"] / max(info["surface_mm2"], 1e-9)
-    if thickness < 0.8:
-        notes.append(f"ℹ️ Average wall thickness is only about {thickness:.2f} mm — it may be fragile to print; consider thickening thin parts.")
+    # 2V/A is not a minimum wall-thickness measurement. Do not present it as one.
     if max(info["size"]) > 256:
         notes.append("ℹ️ At least one dimension is over 256 mm, larger than many hobby 3D-printer beds — scale it down or split it for printing.")
     if info["pieces"] > 1:
@@ -857,14 +869,15 @@ def _corner_normals(verts, tris, face_n, threshold_deg=38.0):
     cos_t = math.cos(math.radians(threshold_deg))
     out = np.zeros((n_tri, 3, 3))
     for corner in range(3):
-        neigh = pad[tris[:, corner]]                     # (n_tri, max_deg)
-        ok = neigh >= 0
-        nn = face_n[np.where(ok, neigh, 0)]              # (n_tri, max_deg, 3)
-        agree = (nn @ face_n[:, :, None]).squeeze(-1) > cos_t
-        weights = (ok & agree)[:, :, None]
-        summed = (nn * weights).sum(axis=1)
-        length = np.linalg.norm(summed, axis=1, keepdims=True)
-        out[:, corner] = np.divide(summed, length, out=face_n.copy(), where=length > 1e-12)
+        for start in range(0, n_tri, 8192):
+            end = min(start+8192,n_tri)
+            neigh = pad[tris[start:end, corner]]
+            ok = neigh >= 0
+            nn = face_n[np.where(ok, neigh, 0)]
+            agree = (nn @ face_n[start:end, :, None]).squeeze(-1) > cos_t
+            summed = (nn * (ok & agree)[:, :, None]).sum(axis=1)
+            length = np.linalg.norm(summed, axis=1, keepdims=True)
+            out[start:end, corner] = np.divide(summed, length, out=face_n[start:end].copy(), where=length > 1e-12)
     return out
 
 

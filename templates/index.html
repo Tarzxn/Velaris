@@ -86,12 +86,16 @@
       <h1 class="hero" id="heroTitle">What can I help with?</h1>
       <div class="composer-zone">
         <form id="composer" class="composer" autocomplete="off">
+          <div id="attachments" class="attachments" aria-label="Attached images"></div>
+          <p id="uploadError" class="upload-error" role="status" hidden></p>
+          <input type="file" id="photoInput" accept="image/jpeg,image/png,image/webp,image/gif" multiple hidden>
           <div class="chips" id="chips"></div>
           <textarea id="prompt" rows="1" placeholder="Ask anything" aria-label="Message Velaris"></textarea>
           <div class="composer-row">
             <div class="plus-wrap">
               <button type="button" class="icon-btn round" id="plusBtn" aria-label="Add tools" aria-haspopup="menu"><span data-icon="plus"></span></button>
               <div class="menu up" id="plusMenu" role="menu">
+                <button type="button" class="menu-row" id="attachPhoto"><span data-icon="image"></span><span class="grow">Attach photos <small>(up to 4)</small></span></button>
                 <button type="button" class="menu-row" id="toggleSearch"><span data-icon="globe"></span><span class="grow">Web search</span><span class="switch"></span></button>
                 <button type="button" class="menu-row" id="toggleBuild"><span data-icon="code"></span><span class="grow">Build files <small>(Codex mode)</small></span><span class="switch"></span></button>
               </div>
@@ -101,7 +105,7 @@
           </div>
         </form>
         <div class="suggestions" id="suggestions"></div>
-        <p class="fineprint">Velaris can make mistakes. Check important info and review generated files before using them.</p>
+        <p class="fineprint">Review generated files before use. Photos and downloads last up to 2 hours and may expire sooner when the server restarts. Download files you want to keep.</p>
       </div>
     </div>
   </main>

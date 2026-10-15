@@ -62,6 +62,7 @@ function setTheme(pref) { try { localStorage.setItem('velaris.theme', pref); } c
 const FT = {
   docx: ['#2b579a', 'DOC'], doc: ['#2b579a', 'DOC'], xlsx: ['#1d7a46', 'XLS'], csv: ['#1d7a46', 'CSV'], tsv: ['#1d7a46', 'TSV'], pptx: ['#c43e1c', 'PPT'],
   pdf: ['#d92d20', 'PDF'], stl: ['#7c3aed', '3D'], png: ['#0891b2', 'IMG'], jpg: ['#0891b2', 'IMG'], jpeg: ['#0891b2', 'IMG'], webp: ['#0891b2', 'IMG'], gif: ['#0891b2', 'GIF'],
+  glb: ['#7c3aed', '3D'],
   svg: ['#d97706', 'SVG'], html: ['#e44d26', 'HTML'], htm: ['#e44d26', 'HTML'], css: ['#2563eb', 'CSS'], js: ['#a16207', 'JS'], mjs: ['#a16207', 'JS'], ts: ['#2563eb', 'TS'],
   tsx: ['#2563eb', 'TSX'], jsx: ['#a16207', 'JSX'], py: ['#3776ab', 'PY'], json: ['#52525b', 'JSON'], md: ['#475569', 'MD'], txt: ['#64748b', 'TXT'], zip: ['#6b7280', 'ZIP'],
   sh: ['#16a34a', 'SH'], sql: ['#0d9488', 'SQL'], yml: ['#a21caf', 'YML'], yaml: ['#a21caf', 'YML'], xml: ['#ea580c', 'XML'], java: ['#b45309', 'JAVA'],
@@ -180,7 +181,7 @@ const FILE_TTL_MS = 2 * 60 * 60 * 1000; // server prunes workspaces after 2h
 const state = {
   model: prefs.model || '', power: prefs.power || 'medium', models: [], webSearch: false, webSearchAvailable: false, build: false,
   conversations: {}, activeId: null, sending: false, controller: null, sidebarCollapsed: !!prefs.sidebarCollapsed,
-  stick: true, filter: '',
+  stick: true, filter: '', images: [], uploading: false,
 };
 const scroller = $('#scroller'), thread = $('#conversation'), promptEl = $('#prompt'), sendBtn = $('#send');
 const mobile = () => matchMedia('(max-width: 820px)').matches;
@@ -204,7 +205,7 @@ function ensureConv() {
   state.activeId = id;
   return state.conversations[id];
 }
-const historyFor = (conv) => conv.messages.filter(m => !m.error && typeof m.content === 'string' && m.content).map(m => ({ role: m.role, content: m.content }));
+const historyFor = (conv) => conv.messages.filter(m => !m.error && typeof m.content === 'string' && m.content).map(m => ({ role: m.role, content: m.content + (m.photoNotes ? '\nPhoto reference observations: '+m.photoNotes : '') }));
 function persist() { const c = activeConv(); if (c) { c.updatedAt = Date.now(); saveConversations(); renderSidebarList(); } }
 function syncEmpty() { document.body.classList.toggle('empty', !(activeConv() && activeConv().messages.length)); }
 
@@ -230,13 +231,17 @@ function renderSidebarList() {
   box.innerHTML = html;
 }
 function openChat(id) {
+  if (state.uploading) return;
   if (!state.conversations[id]) return;
   if (state.sending) state.controller?.abort();
+  state.images = []; renderAttachments(); uploadMessage('');
   state.activeId = id; redrawThread(); renderSidebarList(); closeSidebarIfMobile(); closePanel();
 }
 function startNewChat() {
+  if (state.uploading) return;
   if (state.sending) state.controller?.abort();
   state.activeId = null; redrawThread(); renderSidebarList(); closePanel(); closeSidebarIfMobile();
+  state.images = []; renderAttachments(); uploadMessage('');
   promptEl.value = ''; autoResize(); promptEl.focus();
 }
 function deleteChat(id) {
@@ -324,6 +329,8 @@ function foldHtml(t, live) {
 
 function userNode(msg, index) {
   const n = el(`<div class="msg user" data-index="${index}"><div class="bubble" title="Double-click to edit">${escapeHtml(msg.content)}</div></div>`);
+  const photos = (msg.images || []).filter(p => /^[a-f0-9]{32}$/.test(p.id));
+  if (photos.length) n.prepend(el(`<div class="user-photos">${photos.map(p => `<img src="/api/uploads/${p.id}" alt="${escapeHtml(p.name)}" title="${escapeHtml(p.name)}" loading="lazy">`).join('')}</div>`));
   return n;
 }
 function assistantNode(msg, index) {
@@ -398,10 +405,18 @@ function setSending(on) {
   sendBtn.setAttribute('aria-label', on ? 'Stop generating' : 'Send message');
   updateSendEnabled();
 }
-function updateSendEnabled() { sendBtn.disabled = !state.sending && !promptEl.value.trim(); }
+function updateSendEnabled() {
+  sendBtn.disabled = !state.sending && (state.uploading || (!promptEl.value.trim() && !state.images.length));
+  $('#attachPhoto').disabled = state.sending || state.uploading;
+}
 
 async function ask(promptText) {
   const conv = activeConv();
+  const currentUser = [...conv.messages].reverse().find(m => m.role === 'user');
+  let imageRefs = currentUser?.images || [];
+  if (!imageRefs.length && /\b(edit|photo|image|picture|reference)\b/i.test(promptText)) {
+    imageRefs = [...conv.messages].reverse().find(m => m.role === 'user' && m.images?.length)?.images || [];
+  }
   const node = assistantNode({ role: 'assistant', content: '' }, conv.messages.length);
   $('.msg-tools', node).innerHTML = ''; $('.a-body', node).innerHTML = '<span class="dot-pulse"></span>';
   thread.append(node); scrollToBottom(true);
@@ -425,7 +440,7 @@ async function ask(promptText) {
   try {
     const res = await fetch('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: state.controller.signal,
-      body: JSON.stringify({ prompt: promptText, model: state.model, history: historyFor(conv).slice(0, -1), web_search: state.webSearch, power: state.power, mode: state.build ? 'velaris' : 'assist' }),
+      body: JSON.stringify({ prompt: promptText, images: imageRefs.map(p => ({id:p.id})), workspaces: conv.messages.filter(m => m.data?.workspace).slice(-2).map(m => m.data.workspace), model: state.model, history: historyFor(conv).slice(0, -1), web_search: state.webSearch, power: state.power, mode: state.build ? 'velaris' : 'assist' }),
     });
     const ctype = res.headers.get('content-type') || '';
     if (!ctype.includes('application/x-ndjson')) {
@@ -451,6 +466,7 @@ async function ask(promptText) {
     if (t.thinking.length > 12000) t.thinking = t.thinking.slice(-12000);
     if (t.steps.length < 2 && !final.files?.length) t.steps = [];
     const msg = { role: 'assistant', content: final.reply, data: final, trace: { thinking: t.thinking, thinkSecs: t.thinkSecs, steps: t.steps, workSecs: t.workSecs }, ts: Date.now() };
+    if (currentUser && final.photoNotes) currentUser.photoNotes = final.photoNotes;
     conv.messages.push(msg);
     const finalNode = assistantNode(msg, conv.messages.length - 1);
     node.replaceWith(finalNode);
@@ -475,9 +491,10 @@ async function ask(promptText) {
 }
 
 async function submit() {
-  const text = promptEl.value.trim(); if (!text || state.sending) return;
+  const text = promptEl.value.trim() || (state.images.length ? 'Describe the attached photos.' : ''); if (!text || state.sending || state.uploading) return;
   const conv = ensureConv();
-  const msg = { role: 'user', content: text, ts: Date.now() };
+  const msg = { role: 'user', content: text, images: state.images.slice(), ts: Date.now() };
+  state.images = []; renderAttachments();
   conv.messages.push(msg);
   if (!conv.title) conv.title = titleFor(text);
   syncEmpty(); thread.append(userNode(msg, conv.messages.length - 1));
@@ -503,11 +520,49 @@ thread.addEventListener('click', async (e) => {
   const b = e.target.closest('[data-edit]'); if (!b) return;
   if (b.dataset.edit === 'cancel') { redrawThread(); return; }
   const idx = +b.closest('.msg').dataset.index, conv = activeConv(), text = $('.edit-area', thread).value.trim(); if (!text) return;
-  conv.messages = conv.messages.slice(0, idx); conv.messages.push({ role: 'user', content: text, ts: Date.now() });
+  const images = conv.messages[idx].images || [];
+  conv.messages = conv.messages.slice(0, idx); conv.messages.push({ role: 'user', content: text, images, ts: Date.now() });
   redrawThread(); persist(); await ask(text);
 });
 
 // ───────────────────────────── Composer ─────────────────────────────
+function renderAttachments() {
+  $('#attachments').innerHTML = state.images.map((p,i) => `<figure class="attachment"><img src="/api/uploads/${p.id}" alt="${escapeHtml(p.name)}"><figcaption>${escapeHtml(p.name)}</figcaption><button type="button" data-remove-photo="${i}" aria-label="Remove ${escapeHtml(p.name)}">×</button></figure>`).join('');
+  updateSendEnabled();
+}
+function uploadMessage(text) {
+  const box = $('#uploadError'); box.textContent = text; box.hidden = !text;
+}
+async function addPhotos(files) {
+  if (state.sending || state.uploading) return;
+  if (!files.length) return;
+  if (files.length + state.images.length > 4) { uploadMessage('Attach at most 4 photos per message.'); return; }
+  if (files.some(f => !['image/jpeg','image/png','image/webp','image/gif'].includes(f.type) || f.size > 8*1024*1024)) { uploadMessage('Use JPEG, PNG, WebP or GIF, at most 8 MB per image.'); return; }
+  if (files.reduce((n,f) => n+f.size,0) > 19*1024*1024) { uploadMessage('Keep the selected photos under 19 MB in total.'); return; }
+  state.uploading = true; updateSendEnabled(); uploadMessage('Uploading photos…');
+  try {
+    const form = new FormData(); files.forEach(f => form.append('images',f));
+    const response = await fetch('/api/uploads',{method:'POST',body:form});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Upload failed.');
+    state.images.push(...result.images); renderAttachments(); uploadMessage('');
+  } catch (error) { uploadMessage(error.message || 'Upload failed. Please retry.'); }
+  finally { state.uploading = false; updateSendEnabled(); $('#photoInput').value = ''; }
+}
+$('#attachPhoto').onclick = () => { closeMenus(); $('#photoInput').click(); };
+$('#photoInput').onchange = e => addPhotos(Array.from(e.target.files));
+$('#attachments').onclick = e => {
+  const b = e.target.closest('[data-remove-photo]'); if (!b || state.uploading) return;
+  state.images.splice(+b.dataset.removePhoto,1); renderAttachments();
+};
+$('#composer').addEventListener('dragover',e => { e.preventDefault(); $('#composer').classList.add('dragging'); });
+$('#composer').addEventListener('dragleave',e => { if (!$('#composer').contains(e.relatedTarget)) $('#composer').classList.remove('dragging'); });
+$('#composer').addEventListener('drop',e => { e.preventDefault(); $('#composer').classList.remove('dragging'); addPhotos(Array.from(e.dataTransfer.files)); });
+promptEl.addEventListener('paste',e => {
+  const files = Array.from(e.clipboardData?.items || []).filter(i => i.kind === 'file' && i.type.startsWith('image/')).map(i => i.getAsFile()).filter(Boolean);
+  if (files.length) { e.preventDefault(); addPhotos(files); }
+});
+
 function autoResize() {
   promptEl.style.height = 'auto'; promptEl.style.height = Math.min(promptEl.scrollHeight, 220) + 'px';
   const box = $('#composer');
@@ -689,7 +744,7 @@ function renderPanelBody() {
       body.innerHTML = '<div class="stl-wrap"></div>';
       const wrap = $('.stl-wrap', body), token = panel.token;
       mountStl(wrap, wsUrl('/api/download', ws, path)).then(v => { if (token === panel.token) panel.viewer = v; else v?.dispose(); }).catch(err => {
-        const prev = panel.data.files.find(f => f.path === path.replace(/\.stl$/i, '-preview.png'));
+        const prev = panel.data.files.find(f => f.path === path.replace(/\.(stl|glb)$/i, '-preview.png'));
         wrap.innerHTML = prev ? `<div class="pb-img" style="background:none"><img alt="Preview" src="${wsUrl('/api/preview', ws, prev.path)}"></div>` : `<div class="pb-center">${escapeHtml(err.message)}</div>`;
       });
       break;
@@ -700,8 +755,10 @@ function renderPanelBody() {
 
 // ───────────────────────────── STL viewer (WebGL, no libraries) ─────────────────────────────
 async function mountStl(wrap, url) {
-  const buf = await (await fetch(url)).arrayBuffer();
-  const tris = parseStl(buf);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error('This model has expired or is unavailable. Generate it again.');
+  const buf = await response.arrayBuffer();
+  const tris = /\.glb$/i.test(url) ? parseGlb(buf) : parseStl(buf);
   if (!tris.count) throw new Error('This STL has no triangles.');
   const canvas = document.createElement('canvas'); wrap.append(canvas);
   const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
@@ -753,6 +810,32 @@ async function mountStl(wrap, url) {
   raf = requestAnimationFrame(draw);
   return { dispose() { dead = true; cancelAnimationFrame(raf); ro.disconnect(); gl.getExtension('WEBGL_lose_context')?.loseContext(); } };
 }
+function parseGlb(buf) {
+  const dv = new DataView(buf);
+  if (buf.byteLength < 28 || dv.getUint32(0,true) !== 0x46546c67 || dv.getUint32(4,true) !== 2 || dv.getUint32(8,true) !== buf.byteLength) throw new Error('Invalid GLB file.');
+  const size = dv.getUint32(12,true);
+  if (size+28 > buf.byteLength) throw new Error('Truncated GLB file.');
+  const doc = JSON.parse(new TextDecoder().decode(new Uint8Array(buf,20,size)));
+  const base = 28+size, primitive = doc.meshes[0].primitives[0];
+  const read = (id,width,type) => {
+    const a = doc.accessors[id], view = doc.bufferViews[a.bufferView];
+    const offset = base+(view.byteOffset || 0)+(a.byteOffset || 0);
+    if (a.componentType !== type || a.count > 600000 || offset+a.count*width*4 > buf.byteLength) throw new Error('Unsupported GLB accessor.');
+    return new (type === 5126 ? Float32Array : Uint32Array)(buf,offset,a.count*width);
+  };
+  const vertices = read(primitive.attributes.POSITION,3,5126), normals = read(primitive.attributes.NORMAL,3,5126), indices = read(primitive.indices,1,5125);
+  const count = indices.length/3, pos = new Float32Array(indices.length*3), nrm = new Float32Array(pos.length);
+  const min = [Infinity,Infinity,Infinity], max = [-Infinity,-Infinity,-Infinity];
+  for (let i=0;i<indices.length;i++) {
+    const v = indices[i]*3;
+    if (v+2 >= vertices.length) throw new Error('GLB index out of range.');
+    pos.set([vertices[v]*1000,-vertices[v+2]*1000,vertices[v+1]*1000],i*3);
+    nrm.set([normals[v],-normals[v+2],normals[v+1]],i*3);
+    for (let k=0;k<3;k++) { min[k]=Math.min(min[k],pos[i*3+k]); max[k]=Math.max(max[k],pos[i*3+k]); }
+  }
+  return {count,pos,nrm,min,max};
+}
+
 function parseStl(buf) {
   const dv = new DataView(buf); let count = 0, pos;
   const n = buf.byteLength >= 84 ? dv.getUint32(80, true) : 0;

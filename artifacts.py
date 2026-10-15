@@ -6,6 +6,7 @@ charts, images, SVG, ZIP, STL, and a validation pass that re-opens each result
 with the matching library so a corrupt file is caught before the user sees it.
 """
 import base64
+import ast
 import csv
 import datetime as dt
 import io
@@ -16,6 +17,7 @@ import shutil
 import tempfile
 import textwrap
 import uuid
+import threading
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
@@ -25,14 +27,18 @@ from xml.sax.saxutils import escape as xml_escape
 import requests
 
 import cad_engine
-from stl_engine import render_ascii_stl, run_stl_program, safe_path
+import mesh_engine
+import model_pipeline
+import image_provider
+from path_utils import safe_path
 
-ARTIFACT_KINDS = {"text", "base64", "image", "chart", "docx", "xlsx", "pptx", "pdf", "stl", "zip"}
+ARTIFACT_KINDS = {"text", "base64", "image", "chart", "docx", "xlsx", "pptx", "pdf", "stl", "glb", "zip"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
 RASTER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 OFFICE_KINDS = {"pdf", "docx", "xlsx", "pptx"}
 
 EXT_TO_KIND = {
+    ".glb": "glb",
     ".docx": "docx", ".xlsx": "xlsx", ".pptx": "pptx", ".pdf": "pdf", ".stl": "stl", ".zip": "zip",
     ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image", ".gif": "image",
 }
@@ -49,6 +55,7 @@ KIND_ALIASES = {
     "archive": "zip",
 }
 DEFAULT_EXT = {"pdf": ".pdf", "docx": ".docx", "xlsx": ".xlsx", "pptx": ".pptx", "stl": ".stl",
+               "glb": ".glb",
                "image": ".png", "chart": ".png", "zip": ".zip", "text": ".md", "base64": ".bin"}
 
 MAX_BASE64_BYTES = 30 * 1024 * 1024
@@ -56,8 +63,7 @@ MAX_ZIP_ENTRIES = 100
 MAX_SHEETS = 20
 MAX_SHEET_ROWS = 50_000
 
-IMAGE_API_URL = "https://image.pollinations.ai/prompt/{prompt}"
-IMAGE_TIMEOUT = 90
+_BUILD_LOCK = threading.RLock()  # one memory-heavy artifact at a time on Render Free
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 
@@ -70,6 +76,7 @@ def strip_control(text):
 # Request analysis
 # --------------------------------------------------------------------------
 _FORMAT_WORDS = [
+    ("glb", r"glb|gltf"),
     ("pdf", r"pdf|portable document"),
     ("docx", r"docx|word (?:document|doc|file)|ms word|microsoft word"),
     ("xlsx", r"xlsx|excel(?: (?:spreadsheet|file|sheet|workbook))?|spreadsheet|workbook"),
@@ -170,7 +177,7 @@ def normalize_artifact_item(item, prompt=""):
         path = path.with_suffix(default_extension(kind))
     elif kind == "text" and ext in EXT_TO_KIND and EXT_TO_KIND[ext] != "text":
         kind = EXT_TO_KIND[ext]
-    elif kind in OFFICE_KINDS | {"stl", "zip"} and ext != default_extension(kind):
+    elif kind in OFFICE_KINDS | {"stl", "glb", "zip"} and ext != default_extension(kind):
         path = path.with_suffix(default_extension(kind))  # keep extension and renderer consistent
 
     if kind == "image" and path.suffix.lower() not in RASTER_EXTENSIONS:
@@ -597,6 +604,10 @@ _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 def _coerce_cell(value):
     """-> (value, number_format|None, is_text_forced)"""
+    if isinstance(value,float) and not math.isfinite(value):
+        raise ValueError('Spreadsheet numbers must be finite')
+    if isinstance(value,str) and len(value) > 32767:
+        raise ValueError('A spreadsheet cell exceeds the Excel 32,767-character limit')
     if value is None or isinstance(value, (bool, int, float)):
         return value, None, False
     if isinstance(value, (dict, list)):
@@ -631,7 +642,7 @@ def _coerce_cell(value):
             return dt.date.fromisoformat(s), "yyyy-mm-dd", False
         except ValueError:
             pass
-    return s[:32000], None, False
+    return s, None, False
 
 
 def _sheet_title(name, taken):
@@ -690,7 +701,11 @@ def _parse_sheets(content):
     sheets = [(n, r) for n, r in sheets if r]
     if not sheets:
         raise ValueError("Spreadsheet has no data")
-    return sheets[:MAX_SHEETS]
+    if len(sheets) > MAX_SHEETS:
+        raise ValueError(f'Spreadsheet exceeds {MAX_SHEETS} sheets; split the request')
+    if any(len(rows) > MAX_SHEET_ROWS for _, rows in sheets):
+        raise ValueError(f'Spreadsheet exceeds {MAX_SHEET_ROWS} rows; split the request')
+    return sheets
 
 
 def write_xlsx(path, content):
@@ -743,6 +758,8 @@ def write_xlsx(path, content):
         ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
         ws.page_setup.orientation = "landscape"; ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
     wb.properties.creator = "Velaris"
+    from openpyxl.workbook.properties import CalcProperties
+    wb.calculation = CalcProperties(fullCalcOnLoad=True, forceFullCalc=True)
     wb.save(str(path))
 
 
@@ -1098,41 +1115,7 @@ _ASPECTS = {"portrait": (832, 1216), "tall": (832, 1216), "9:16": (832, 1216), "
 
 
 def write_image(path, content):
-    from PIL import Image
-    prompt, aspect = str(content), "square"
-    parsed = content if isinstance(content, dict) else None
-    if parsed is None:
-        try:
-            candidate = json.loads(content)
-            parsed = candidate if isinstance(candidate, dict) else None
-        except (TypeError, ValueError):
-            parsed = None
-    if parsed and "prompt" in parsed:
-        prompt, aspect = str(parsed["prompt"]), str(parsed.get("aspect", "square")).lower()
-    width, height = _ASPECTS.get(aspect, (1024, 1024))
-    prompt = strip_control(prompt).strip()[:800] or "abstract art"
-    url = IMAGE_API_URL.format(prompt=quote(prompt)) + f"?width={width}&height={height}&nologo=true&model=flux&seed={uuid.uuid4().int % 10**6}"
-    last_error = None
-    for attempt in range(2):
-        try:
-            response = requests.get(url, timeout=IMAGE_TIMEOUT, headers={"User-Agent": "Velaris/2"})
-            response.raise_for_status()
-            image = Image.open(io.BytesIO(response.content))
-            image.load()
-            break
-        except Exception as error:  # network error, HTTP error, or bytes that are not an image
-            last_error = error
-    else:
-        raise ValueError(f"Image generation failed ({type(last_error).__name__}: {last_error}). Try again in a moment.")
-    ext = path.suffix.lower()
-    if ext in (".jpg", ".jpeg"):
-        image.convert("RGB").save(str(path), "JPEG", quality=92)
-    elif ext == ".webp":
-        image.save(str(path), "WEBP", quality=92)
-    elif ext == ".gif":
-        image.convert("P").save(str(path), "GIF")
-    else:
-        image.save(str(path), "PNG")
+    return image_provider.generate(path, content)
 
 
 def _clean_svg(text):
@@ -1173,7 +1156,7 @@ def _write_text(path, content):
         try:
             text = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
         except ValueError as error:
-            warnings.append(f"⚠️ '{path.name}' is not valid JSON ({error}); saved as written.")
+            raise ValueError(f"'{path.name}' is not valid JSON: {error}") from error
     elif ext == ".svg":
         text = _clean_svg(text)
     if not text.endswith("\n"):
@@ -1212,11 +1195,13 @@ def _write_zip(root, path, content, prompt, depth):
         entries = entries.get("files", [])
     if not isinstance(entries, list):
         raise ValueError("ZIP content must be a JSON list of files")
+    if not entries or len(entries) > MAX_ZIP_ENTRIES:
+        raise ValueError(f"ZIP must contain 1–{MAX_ZIP_ENTRIES} entries; it will not be silently truncated")
     warnings, written = [], 0
     build_dir = Path(tempfile.mkdtemp(prefix=".zip-build-", dir=root))
     try:
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-            for entry in entries[:MAX_ZIP_ENTRIES]:
+            for entry in entries:
                 try:
                     item = normalize_artifact_item(entry, "")
                     if item["kind"] == "zip":
@@ -1224,11 +1209,13 @@ def _write_zip(root, path, content, prompt, depth):
                     item["path"] = _unique_rel(build_dir, item["path"])
                     warnings += _write_item(build_dir, item, prompt, depth + 1)
                     validate_artifact(build_dir / item["path"], item["kind"])
-                    archive.write(build_dir / item["path"], item["path"])
                     written += 1
                 except Exception as error:
                     name = entry.get("path", "?") if isinstance(entry, dict) else "?"
-                    warnings.append(f"⚠️ Skipped '{name}' inside the ZIP: {error}")
+                    raise ValueError(f"ZIP could not be completed: '{name}': {error}") from error
+            for child in sorted(build_dir.rglob('*')):
+                if child.is_file():
+                    archive.write(child, child.relative_to(build_dir).as_posix())
     finally:
         shutil.rmtree(build_dir, ignore_errors=True)
     if not written:
@@ -1236,7 +1223,7 @@ def _write_zip(root, path, content, prompt, depth):
     return warnings
 
 
-def _write_item(root, item, prompt="", depth=0):
+def _write_item(root, item, prompt="", depth=0, image_refs=()):
     path = root / safe_path(item["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
     kind, content = item["kind"], item.get("content", "")
@@ -1247,30 +1234,23 @@ def _write_item(root, item, prompt="", depth=0):
     elif kind == "image":
         if path.suffix.lower() == ".svg":
             return _write_text(path, content)
-        write_image(path, content)
+        image_provider.generate(path, content, image_refs)
     elif kind == "chart":
         render_chart(_parse_json_content(content), path)
     elif kind == "docx":
         write_docx(path, content)
     elif kind == "xlsx":
         write_xlsx(path, content)
+        return ['ℹ️ Spreadsheet formulas are preserved for recalculation on opening in Excel or LibreOffice; their results were not evaluated by the server.']
     elif kind == "pptx":
         write_pptx(path, content)
     elif kind == "pdf":
         write_pdf(path, content)
     elif kind == "zip":
         return _write_zip(root, path, content, prompt, depth)
-    elif kind == "stl":
+    elif kind in ("stl", "glb"):
         spec = _parse_json_content(content)
-        if cad_engine.AVAILABLE:
-            # Real CSG kernel: guaranteed watertight, binary STL + shaded preview image.
-            notes, _info = cad_engine.build_files(path, spec, path.with_name(path.stem + "-preview.png"))
-            return notes
-        triangles, warnings = run_stl_program(spec)  # legacy primitive-assembly fallback
-        if not triangles:
-            raise ValueError("The 3D build program produced no geometry")
-        path.write_text(render_ascii_stl(triangles), encoding="ascii")
-        return warnings
+        return model_pipeline.build_files(path, spec)
     else:
         raise ValueError(f"Unsupported artifact kind: {kind}")
     return []
@@ -1283,12 +1263,22 @@ def validate_artifact(path, kind):
     if not data:
         raise ValueError("Generated file is empty")
     ext = path.suffix.lower()
+    # A binary payload must not bypass validation just by labelling itself base64.
+    if kind == 'base64':
+        kind = EXT_TO_KIND.get(ext,kind)
     if kind == "pdf":
-        if not data.startswith(b"%PDF-") or b"%%EOF" not in data[-2048:]:
-            raise ValueError("Generated PDF is incomplete")
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data), strict=True)
+        if not reader.pages:
+            raise ValueError("Generated PDF has no pages")
+        for page in reader.pages:
+            page.extract_text()  # actually decode every content stream
     elif kind in ("docx", "xlsx", "pptx"):
         if not zipfile.is_zipfile(path):
             raise ValueError(f"Generated {kind.upper()} is not a valid Office container")
+        with zipfile.ZipFile(path) as archive:
+            if archive.testzip() is not None:
+                raise ValueError('Office file contains a corrupt ZIP member')
         if kind == "docx":
             from docx import Document
             doc = Document(str(path))
@@ -1297,8 +1287,14 @@ def validate_artifact(path, kind):
         elif kind == "xlsx":
             from openpyxl import load_workbook
             wb = load_workbook(str(path))
-            if not any(ws.max_row >= 1 and ws.max_column >= 1 for ws in wb.worksheets):
-                raise ValueError("Generated XLSX has no cells")
+            if not any(cell.value is not None for ws in wb.worksheets for row in ws for cell in row):
+                raise ValueError("Generated XLSX has no populated cells")
+            for ws in wb.worksheets:
+                for row in ws:
+                    for cell in row:
+                        if cell.data_type == 'e':
+                            raise ValueError(f"Spreadsheet contains error {cell.value} at {ws.title}!{cell.coordinate}")
+            wb.close()
         else:
             from pptx import Presentation
             if len(Presentation(str(path)).slides) < 1:
@@ -1312,15 +1308,21 @@ def validate_artifact(path, kind):
             if archive.testzip() is not None or not archive.namelist():
                 raise ValueError("Generated ZIP is corrupt or empty")
     elif kind == "stl":
-        if data[:5].lower() == b"solid" and b"facet normal" in data[:400]:  # ASCII (legacy engine)
-            if data.lower().count(b"facet normal") < 4 or b"nan" in data.lower():
-                raise ValueError("Generated STL is empty or malformed")
-        else:
-            cad_engine.verify_binary_stl(path)
+        mesh_engine.read_stl(path).validate(connected=False)
+    elif kind == "glb":
+        mesh_engine.read_glb(path).validate(connected=False)
+    elif kind == "text":
+        text = data.decode('utf-8')
+        if ext == '.json':
+            json.loads(text)
+        elif ext == '.py':
+            ast.parse(text, filename=path.name)
+        elif ext == '.svg':
+            ET.fromstring(text)
     return len(data)
 
 
-def produce_artifact(root, raw_item, prompt=""):
+def produce_artifact(root, raw_item, prompt="", image_refs=()):
     """Normalize -> write -> validate one artifact. Returns
     {'path', 'kind', 'bytes', 'warnings'}; raises ValueError on failure and
     never leaves a partial file behind."""
@@ -1328,17 +1330,29 @@ def produce_artifact(root, raw_item, prompt=""):
     item = normalize_artifact_item(raw_item, prompt)
     item["path"] = _unique_rel(root, item["path"])
     target = root / item["path"]
-    try:
-        warnings = _write_item(root, item, prompt)
-        size = validate_artifact(target, item["kind"])
-    except json.JSONDecodeError as error:
-        target.unlink(missing_ok=True)
-        raise ValueError(f"its content was not valid JSON ({error.msg} at position {error.pos})")
-    except Exception:
-        target.unlink(missing_ok=True)
-        if item["kind"] == "stl":
-            target.with_name(target.stem + "-preview.png").unlink(missing_ok=True)
-        raise
+    # Stage the entire deliverable (including model companion files). Failed
+    # builds never leak stale STL/GLB/source/preview files into the manifest.
+    with _BUILD_LOCK:
+        while item['kind'] in ('stl','glb') and any((root / item['path']).with_suffix(ext).exists() for ext in ('.stl','.glb','.model.json')):
+            p = Path(item['path'])
+            item['path'] = _unique_rel(root, str(p.with_name(p.stem+'-new'+p.suffix)))
+        with tempfile.TemporaryDirectory(prefix='.artifact-', dir=root) as temp:
+            stage = Path(temp)
+            warnings = _write_item(stage, item, prompt, image_refs=image_refs)
+            size = validate_artifact(stage / item['path'], item['kind'])
+            files = [p for p in stage.rglob('*') if p.is_file()]
+            if any((root / p.relative_to(stage)).exists() for p in files):
+                raise ValueError('A companion filename is already in use; choose another model filename')
+            published = []
+            try:
+                for p in files:
+                    dest = root / p.relative_to(stage)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    p.replace(dest); published.append(dest)
+            except Exception:
+                for p in published:
+                    p.unlink(missing_ok=True)
+                raise
     return {"path": item["path"], "kind": item["kind"], "bytes": size, "warnings": warnings}
 
 
